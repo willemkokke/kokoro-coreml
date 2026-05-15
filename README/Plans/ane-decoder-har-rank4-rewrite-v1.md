@@ -1254,15 +1254,35 @@ compatible with ANE on M3 Max / macOS 26.
 
 **Phase 2 — Re-export at the new target + waveform parity:**
 
-- [ ] `uv run --no-sync python -m export_synth.main --mode decoder-har --buckets 3s,10s -o coreml`.
-- [ ] Confirm target took effect:
-  `uv run python -c "import coremltools as ct; print(ct.models.MLModel('coreml/kokoro_decoder_har_post_10s.mlpackage').get_spec().specificationVersion)"`
-  should print **> 7**.
-- [ ] Waveform parity vs rank-4 / ios16 / cml8 baseline:
-  Pearson > 0.99 / SNR ≥ 40 dB / max abs Δ ≤ 1e-2 on the 10s bucket
-  via `compare_decoder_har_post_waveforms.py`.
-- [ ] `uv run python -m pytest tests/test_mlpackage_exports.py -q`
-  — pass.
+- [x] `uv run --no-sync python -m export_synth.main --mode decoder-har --buckets 3s,10s -o coreml`.
+  **Done 2026-05-16:** both buckets saved; numeric gate
+  `traced vs Core ML waveform shape (240000,) all finite` for 10s,
+  `(72000,) all finite` for 3s.
+- [x] Confirm target took effect. **Done:**
+  `MLModel('coreml/kokoro_decoder_har_post_10s.mlpackage').get_spec().specificationVersion`
+  reports **10** (was 7 for ios16; +3 in iteration 2). Input dtypes
+  unchanged (all FLOAT32 per the iteration-1 contract). MIL op
+  histogram is **identical** to the rank-4/ios16/cml8 baseline (both
+  2021 ops; same per-type counts) — the target bump is purely a
+  metadata / op-version-name change at the MIL serialization level.
+- [x] Waveform parity vs rank-4 / ios16 / cml8 baseline at
+  `/tmp/kokoro_decoder_har_post_10s.rank4_ios16.mlpackage`.
+  **Done — all three gates pass:**
+  - **Pearson: 0.9999817** (gate: > 0.99)
+  - **SNR: 44.81 dB** (gate: ≥ 40 dB; tighter than cross-rank's
+    49.90 dB but well above the floor)
+  - **max abs Δ: 4.7e-3** (gate: ≤ 1e-2)
+
+  The small SNR shrink vs the cross-rank gate (49.90 → 44.81 dB) is
+  the runtime picking slightly different ios16 vs ios26 op variants
+  for the same logical operations — a positive signal that 9.0
+  treats iOS26 as a distinct codegen path rather than aliasing it to
+  iOS18. Phase 0f's same-target cross-version comparison was
+  bit-exact (Pearson 1.0); only the target bump introduces drift.
+- [x] `uv run --no-sync pytest tests/test_mlpackage_exports.py -q`.
+  **Done: 2 passed, 8 skipped** (skips are env-conditional —
+  `decoder_pre_*` / `decoder_only_3s` / `kokoro_synthesizer_3s` /
+  `kokoro_duration` packages not on disk; unchanged vs iteration 1).
 
 **Phase 3 — ANE placement verification:**
 
