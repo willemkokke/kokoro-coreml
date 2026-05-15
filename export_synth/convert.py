@@ -244,6 +244,14 @@ def export_synthesizers(output_dir, buckets_str, debug=False, trace_length: int 
     else:
         convert_backend = "mlprogram"
         target = ct.target.macOS13
+    # Iteration 2 of the HAR-on-ANE engagement effort (see
+    # README/Plans/ane-decoder-har-rank4-rewrite-v1.md §"Iteration 2"):
+    # the decoder-har mode targets ct.target.iOS26 (the latest op set
+    # coremltools 9.0 exposes) so its package matches the macOS 26 ANE
+    # compiler's preferred op-set variants. Other modes keep
+    # ct.target.macOS13 — they have their own (out-of-scope) plans.
+    if mode == "decoder-har" and convert_backend == "mlprogram":
+        target = ct.target.iOS26
     print(f"Using Core ML backend: {convert_backend}")
 
     for name, bucket_samples in buckets.items():

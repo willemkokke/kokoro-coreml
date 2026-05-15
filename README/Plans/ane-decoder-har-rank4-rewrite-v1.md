@@ -1238,11 +1238,19 @@ compatible with ANE on M3 Max / macOS 26.
 
 **Phase 1 — Target bump:**
 
-- [ ] Edit
+- [x] Edit
   [`export_synth/convert.py`](../../export_synth/convert.py): change
   `target = ct.target.macOS13` to `target = ct.target.<LATEST>`,
   scoped to the `decoder-har` mode branch.
-- [ ] `uv run python -m pytest tests/ -q` — green.
+  **Done 2026-05-16:** added a guarded override right after the
+  shared `target = ct.target.macOS13` default —
+  `if mode == "decoder-har" and convert_backend == "mlprogram":
+  target = ct.target.iOS26`. `decoder` and `full` modes keep
+  `ct.target.macOS13`; the `neuralnetwork` backend keeps
+  `ct.target.macOS11`. Inline comment cross-references this plan
+  section.
+- [x] `uv run --no-sync pytest tests/ -q`. **Green:** 43 passed,
+  8 skipped, 0 failed — same baseline as Phase 0e.
 
 **Phase 2 — Re-export at the new target + waveform parity:**
 
