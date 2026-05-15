@@ -1,8 +1,9 @@
 # Requirements for CoreML export
 # IMPORTANT: Use torch 2.5.0 - it's the most recent version tested with coremltools
+# (coremltools 9.0 still installs cleanly against torch 2.5.0 — no transitive bump required).
 torch==2.5.0
 torchaudio
-coremltools==8.3.0
+coremltools==9.0
 numpy==1.26.4
 transformers==4.44.2
 huggingface_hub

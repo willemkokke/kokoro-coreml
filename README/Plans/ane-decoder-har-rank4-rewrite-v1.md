@@ -1188,35 +1188,53 @@ compatible with ANE on M3 Max / macOS 26.
 
 **Phase 0 — Tooling upgrade + 9.0 baseline:**
 
-- [ ] Check installability:
-  `uv pip install --dry-run coremltools==9.0`. If 9.0 forces Python
-  / torch upgrades, accept them in `requirements-export.txt` in the
-  same commit. Record the new pins.
-- [ ] Update `requirements-export.txt`. `uv pip install -r
-  requirements-bakeoff.txt`. Verify the upgrade:
-  `uv run python -c "import coremltools as ct; print(ct.__version__)"`.
-- [ ] Enumerate `ct.target` on 9.0; pick the highest enum value.
-  Record the full list in the
-  [Iteration 2 Open Questions](#iteration-2-open-questions) below
-  and lock the chosen target name in Resolved.
-- [ ] Re-run
-  `uv run python scripts/count_mil_ops.py --probe-conv-lowering`.
-  Hard gate: `all_equivalent: true` still holds.
-- [ ] `uv run python -m pytest tests/ -q`. Expected: 41 passed, 9
-  skipped.
-- [ ] Copy the current
+- [x] Check installability:
+  `uv pip install --dry-run coremltools==9.0`. **Done 2026-05-16:**
+  resolved 12 packages in 531 ms; **no transitive cascade** — only
+  coremltools changes 8.3.0 → 9.0. torch 2.5.0 preserved, numpy
+  preserved, no Python upgrade. Clean install path.
+- [x] Update `requirements-export.txt`. `uv pip install -r
+  requirements-bakeoff.txt`. **Done:** comment block updated to
+  reflect that 9.0 still installs cleanly against torch 2.5.0;
+  `coremltools==8.3.0` → `coremltools==9.0`. Install report:
+  "Resolved 97 packages in 783ms / Uninstalled 1 / Installed 1 -
+  coremltools==8.3.0 / + coremltools==9.0". Verify:
+  `coremltools 9.0` / `torch 2.5.0`.
+- [x] Enumerate `ct.target` on 9.0. **Done:** 9.0 exposes
+  `iOS13..iOS18` (as 8.3.0 did) plus **`ct.target.iOS26 = 10`** —
+  new in 9.0, aligns with the macOS 26.4 host OS. The latest target
+  is locked in Iteration 2 Open Questions Resolved below.
+- [x] Re-run
+  `uv run --no-sync python scripts/count_mil_ops.py --probe-conv-lowering`.
+  **Hard gate PASSED.** All 15 probe cases still equivalent on
+  coremltools 9.0: `all_equivalent: True`, 0 mismatched cases.
+  Conv2d / ConvTranspose2d / pad still lower to single MIL
+  `conv` / `conv_transpose` / `pad` ops. JSON saved at
+  `outputs/ane_rank4/phase0_iter2_probe_cml9.json` (gitignored).
+- [x] `uv run --no-sync pytest tests/ -q`.
+  **Done: 43 passed, 8 skipped, 0 failed** — exact match against the
+  iteration-1 post-fix-pass baseline. No regression from the
+  coremltools upgrade. (Plan's earlier "Expected: 41/9" was stale
+  pre-fix-pass; new baseline is 43/8 since the audit-fix-loop added
+  the B>1 AdaIN parametrize case.)
+- [x] Copy the current
   `coreml/kokoro_decoder_har_post_{3s,10s}.mlpackage` (rank-4 /
   ios16 / cml8) to
   `/tmp/kokoro_decoder_har_post_{3s,10s}.rank4_ios16.mlpackage`.
-- [ ] Re-export at the iteration-1 target (still
+  **Done.**
+- [x] Re-export at the iteration-1 target (still
   `ct.target.macOS13`) under coremltools 9.0; save as
   `/tmp/kokoro_decoder_har_post_10s.rank4_ios16_cml9.mlpackage`
-  alongside. Cross-version waveform parity sanity check:
-  `compare_decoder_har_post_waveforms.py
-  --baseline /tmp/...rank4_ios16.mlpackage
-  --candidate /tmp/...rank4_ios16_cml9.mlpackage`. Expect Pearson
-  > 0.999 / SNR > 50 dB; if not, coremltools 9.0 is changing op
-  lowering numerically — investigate before Phase 1.
+  alongside. Cross-version waveform parity sanity check
+  (`compare_decoder_har_post_waveforms.py`):
+  **Pearson 1.0 / SNR 149.19 dB / max abs Δ 0.0** — **bit-exact** at
+  the 10s bucket on real inputs (HybridTTSPipeline text-to-vocoder
+  path). The coremltools upgrade is numerically a pure no-op on the
+  rank-4 graph at the iteration-1 target. The synthetic-har warning
+  in the same-target cml9 re-export (`⚠️ decoder-har: Core ML
+  waveform not all finite on gate inputs ...`) is the known
+  fp16+synthetic-har false-alarm the script flags inline; real
+  inputs match byte-for-byte.
 
 **Phase 1 — Target bump:**
 
@@ -1283,17 +1301,37 @@ compatible with ANE on M3 Max / macOS 26.
   here?
 - **A:** Section in this plan. The whole HAR-on-ANE investigation
   reads as one document.
+- **Q:** Is `coremltools==9.0` installable on Python 3.12.12 /
+  torch 2.5.0 / macOS 26.4?
+- **A (resolved 2026-05-16 by Phase 0a):** **Yes, cleanly.**
+  `uv pip install --dry-run coremltools==9.0` resolved 12 packages
+  in 531 ms with no transitive cascade — only coremltools changes
+  8.3.0 → 9.0. torch 2.5.0, numpy 1.26.4, transformers 4.44.2 all
+  preserved. The pinned `torch==2.5.0` comment in
+  `requirements-export.txt` was updated to note that 9.0 still
+  installs cleanly against 2.5.0.
+- **Q:** What's the highest `ct.target` value coremltools 9.0
+  exposes?
+- **A (resolved 2026-05-16 by Phase 0c):**
+  **`ct.target.iOS26 = 10`** — new in 9.0 (8.3.0's ceiling was
+  `iOS18 = 9`). Apple skipped iOS19..iOS25 in the enum name (the
+  macOS / iOS version unification at macOS 26 collapsed them into a
+  single jump). This is the target Phase 1 will use; it aligns
+  with the macOS 26.4 host OS.
+- **Q:** Does coremltools 9.0 change MIL lowering for any op type
+  used in the kokoro Generator graph?
+- **A (resolved 2026-05-16 by Phase 0d + Phase 0f):** No, on both
+  axes. **Phase 0d** shows `--probe-conv-lowering` still reports
+  `all_equivalent: true` for all 15 Conv2d / ConvTranspose2d / pad
+  cases. **Phase 0f** re-exported the rank-4 graph at the SAME
+  iteration-1 target (`ct.target.macOS13`) under coremltools 9.0
+  and the resulting `.mlpackage` produces **bit-exact** output vs
+  the cml8 baseline (Pearson 1.0 / SNR 149.19 dB / max abs Δ 0.0
+  on real-input waveform parity). The coremltools upgrade is a
+  numerical no-op on this graph.
 
 #### Unresolved (iter 2)
 
-- **Q:** Is `coremltools==9.0` installable on Python 3.12.12 /
-  torch 2.5.0 / macOS 26.4?
-- **Options:** Phase 0 verifies via `uv pip install --dry-run`. If
-  9.0 wants Python ≥ 3.13 or torch ≥ 2.7, widen the upgrade scope.
-- **Q:** What's the highest `ct.target` value coremltools 9.0
-  exposes?
-- **Options:** Phase 0 enumerates and locks. Expected `iOS19+` /
-  `macOS26`-equivalent.
 - **Q:** Will the macOS app's deployment target accept the new
   OS-version floor?
 - **Options:** Check before merge. If incompatible, iteration 2 is
