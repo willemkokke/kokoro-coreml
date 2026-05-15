@@ -81,6 +81,17 @@ Three mechanisms remain possible:
 3. **ANE fallback hurts:** `.all` attempts ANE, then spills or falls back into a
    worse execution path than explicitly excluding ANE.
 
+> **2026-05-15 update — hypothesis #3 confirmed on M3 Max.**
+> See [ANE decoder-har-post investigation](ane-decoder-har-post-investigation.md).
+> Xcode shows 0 of ~1238 ops on Neural Engine for
+> `kokoro_decoder_har_post_10s.mlpackage`; `.all` output is bit-equal to
+> `.cpuAndGPU` (silent GPU fallback); `.all` cold-load is 55× slower than
+> `.cpuAndGPU` (26.5 s vs 0.48 s) for an ANE compile that never succeeds.
+> Espresso emits 322 `Unsupported op` events and 12 `Shape computation
+> issue` events. Root cause is structural: the kokoro Generator graph uses
+> rank-3 `(B, C, T)` tensors and ANE wants rank-4 `(B, C, 1, T)`. The fix
+> is the rank-4 rewrite, not a compute-unit re-routing.
+
 ### Required Ablations
 
 Add two Swift Core ML compute-unit controls to the harness:
