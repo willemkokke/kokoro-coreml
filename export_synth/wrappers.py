@@ -65,18 +65,29 @@ def _is_masked_bidirectional_lstm(module: nn.Module) -> bool:
 
 
 class GeneratorFromHar(nn.Module):
-    """Vocoder tail after hn-nsf harmonic features: same as ``Generator.forward`` once ``har`` exists.
+    """Vocoder tail after hn-nsf harmonic features: same body as ``Generator.forward`` once ``har`` exists.
 
-    PyTorch runs ``f0_upsamp`` → ``m_source`` → ``stft.transform`` on CPU; this module is exported
-    to Core ML for the heavy conv/AdaIN/iSTFT stack (see ``export_synth.convert`` ``decoder-har`` mode).
+    PyTorch runs ``f0_upsamp`` → ``m_source`` → ``stft.transform`` on CPU; this
+    module is exported to Core ML for the heavy conv/AdaIN/iSTFT stack (see
+    ``export_synth.convert`` ``decoder-har`` mode).
+
+    Inputs and outputs at the module boundary stay rank-3 / rank-2 so this
+    wrapper is a drop-in replacement for the original rank-3 version (no
+    runtime caller in Python or Swift needs to change). Internally the
+    body operates on rank-4 ``(B, C, 1, T)`` tensors to keep the Conv2d /
+    ConvTranspose2d / AdaIN2d stack ANE-aligned end to end (see
+    README/Plans/ane-decoder-har-rank4-rewrite-v1.md).
 
     Inputs:
         x_pre: decoder output before the generator, shape ``(B, 512, T_asr)``.
         ref_s: full voice embedding ``(B, 256)``; style uses the first ``VOICE_BASELINE_DIM`` channels.
         har: concat ``[har_spec, har_phase]`` along channel dim, shape ``(B, C, T_har)``.
 
+    Output:
+        waveform: rank-3 ``(B, 1, T_out)`` from ``gen.stft.inverse``.
+
     Called by:
-        - ``export_synth.convert`` when ``mode == \"decoder-har\"``.
+        - ``export_synth.convert`` when ``mode == "decoder-har"``.
         - Runtime: ``kokoro.synthesis_backends.decoder_har_post_bucket_impl`` (PyTorch pre + Core ML).
     """
 
@@ -87,7 +98,13 @@ class GeneratorFromHar(nn.Module):
     def forward(self, x_pre: torch.Tensor, ref_s: torch.Tensor, har: torch.Tensor) -> torch.Tensor:
         s = ref_s[:, : CoreMLExportConstants.VOICE_BASELINE_DIM]
         gen = self.generator
-        x = x_pre
+
+        # Promote to rank-4 (B, C, 1, T) at the body boundary. ``ref_s`` /
+        # ``s`` stays rank-2 (B, style_dim) — AdaIN2d projects to rank-4
+        # internally via .view, no boundary change needed.
+        x = x_pre.unsqueeze(-2)   # (B, 512, 1, T_asr)
+        har = har.unsqueeze(-2)   # (B, C_har, 1, T_har)
+
         for i in range(gen.num_upsamples):
             x = F.leaky_relu(x, negative_slope=0.1)
             x_source = gen.noise_convs[i](har)
@@ -95,12 +112,12 @@ class GeneratorFromHar(nn.Module):
             x = gen.ups[i](x)
             if i == gen.num_upsamples - 1:
                 x = gen.reflection_pad(x)
-            tx = x.size(2)
-            ts = x_source.size(2)
+            tx = x.size(-1)
+            ts = x_source.size(-1)
             if ts < tx:
                 x_source = F.pad(x_source, (0, tx - ts))
             elif ts > tx:
-                x_source = x_source[:, :, :tx]
+                x_source = x_source[:, :, :, :tx]
             x = x + x_source
             xs = None
             for j in range(gen.num_kernels):
@@ -110,7 +127,8 @@ class GeneratorFromHar(nn.Module):
                     xs = xs + gen.resblocks[i * gen.num_kernels + j](x, s)
             x = xs / gen.num_kernels
         x = F.leaky_relu(x)
-        x = gen.conv_post(x)
+        x = gen.conv_post(x)         # (B, post_n_fft + 2, 1, T_post)
+        x = x.squeeze(-2)            # drop H=1; iSTFT.inverse expects rank-3
         spec = torch.exp(x[:, : gen.post_n_fft // 2 + 1, :])
         phase = torch.sin(x[:, gen.post_n_fft // 2 + 1 :, :])
         return gen.stft.inverse(spec, phase)

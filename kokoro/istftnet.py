@@ -150,41 +150,184 @@ class AdaIN1d(nn.Module):
         return (1.0 + gamma_exp) * x_norm + beta_exp
 
 
+def _rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha_param_paths):
+    """Idempotently reshape rank-3 conv weights and rank-3 alpha params to rank-4
+    inside a state_dict, supporting bare and weight_norm-wrapped (legacy and new
+    parametrizations API) forms.
+
+    Used by ``AdaINResBlock1`` and ``Generator`` ``register_load_state_dict_pre_hook``
+    so the pretrained rank-3 ``hexgrad/Kokoro-82M`` checkpoint loads into the
+    rank-4 modules introduced for ANE alignment (see
+    ``README/Plans/ane-decoder-har-rank4-rewrite-v1.md``).
+
+    Args:
+        state_dict: dict being loaded (mutated in place).
+        prefix: module prefix supplied by PyTorch's load hook (e.g.
+            ``"generator.resblocks.0."``).
+        conv_module_paths: iterable of relative module paths for conv layers
+            (e.g. ``"convs1.0"``, ``"ups.0"``). For each, ALL weight-tensor
+            sub-keys are reshaped if rank-3:
+                - ``<path>.weight``               (bare Conv1d/ConvTranspose1d)
+                - ``<path>.weight_g``             (legacy weight_norm magnitude)
+                - ``<path>.weight_v``             (legacy weight_norm direction)
+                - ``<path>.parametrizations.weight.original0`` (new API magnitude)
+                - ``<path>.parametrizations.weight.original1`` (new API direction)
+            A 3D tensor becomes 4D via ``.unsqueeze(-2)`` (inserts H=1 just before
+            the kernel/time axis). 4D tensors pass through unchanged.
+        alpha_param_paths: iterable of relative parameter paths for the Snake1D
+            alpha parameters (e.g. ``"alpha1.0"``). 3D ``(1, C, 1)`` becomes 4D
+            ``(1, C, 1, 1)`` via ``.unsqueeze(-1)``; 4D tensors pass through.
+
+    Designed for reuse by the follow-on ``decoder_pre`` rank-4 plan
+    (``ane-decoder-pre-rank4-rewrite-v1.md``) — `AdainResBlk1d`'s rank-4 rewrite
+    will call this helper with its own ``conv_module_paths`` /
+    ``alpha_param_paths`` lists.
+    """
+    weight_suffixes = (
+        "weight",
+        "weight_g",
+        "weight_v",
+        "parametrizations.weight.original0",
+        "parametrizations.weight.original1",
+    )
+    for module_path in conv_module_paths:
+        for weight_suffix in weight_suffixes:
+            key = f"{prefix}{module_path}.{weight_suffix}"
+            t = state_dict.get(key)
+            if t is not None and t.dim() == 3:
+                state_dict[key] = t.unsqueeze(-2)
+    for param_path in alpha_param_paths:
+        key = f"{prefix}{param_path}"
+        t = state_dict.get(key)
+        if t is not None and t.dim() == 3:
+            state_dict[key] = t.unsqueeze(-1)
+
+
+class AdaIN2d(nn.Module):
+    # Rank-4 sibling of ``AdaIN1d`` for the Generator's ANE-aligned rewrite.
+    #
+    # Same math as ``AdaIN1d`` (manual instance norm over time + style-conditioned
+    # gamma/beta) but operating on ``(B, C, 1, T)`` tensors so the surrounding
+    # Conv2d / ConvTranspose2d stack stays rank-4 throughout. This satisfies
+    # Apple's documented ANE preference for last-axis-largest rank-4 shapes
+    # (see CLAUDE.md Part 4.1 and the rank-3 → rank-4 plan at
+    # README/Plans/ane-decoder-har-rank4-rewrite-v1.md).
+    #
+    # **Deliberately distinct from AdaIN1d.** ``AdaIN1d`` keeps a rank-3 contract
+    # for the Decoder path (``AdainResBlk1d``). Merging the two classes would
+    # couple HAR-post and decoder_pre export rewrites — see Risks and Mitigations
+    # in the rank-4 plan. The decoder_pre follow-on will reuse this same
+    # ``AdaIN2d`` (not introduce a parallel rank-4 AdaIN).
+    #
+    # Parameters:
+    # - style_dim:    Dimension of input style vector (typically 128).
+    # - num_features: Number of channels to normalize (C).
+    #
+    # Forward I/O:
+    # - x: (B, C, 1, T)
+    # - s: (B, style_dim)
+    # - returns: (B, C, 1, T)
+
+    def __init__(self, style_dim, num_features):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = 1e-5
+        # Linear projection to (gamma, beta). Identical fc.weight shape to
+        # AdaIN1d (2C, style_dim), so checkpoints with AdaIN1d-shaped fc load
+        # without translation.
+        self.fc = nn.Linear(style_dim, num_features * 2)
+
+    def forward(self, x, s):
+        # x: (B, C, 1, T), s: (B, style_dim)
+        B, C, H, T = x.shape
+        assert H == 1, f"AdaIN2d expects H=1 axis, got H={H}"
+        assert C == self.num_features, f"AdaIN2d channel mismatch: got {C}, expected {self.num_features}"
+
+        # Reduce over the time axis only; keep_dim broadcasts back over T.
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, unbiased=False, keepdim=True)
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)
+
+        # Project to (gamma, beta) — reshape to (B, 2C, 1, 1) so broadcast
+        # against rank-4 x is implicit (no torch.expand call needed; explicit
+        # expand+reshape sequences were what triggered the rank-3 graph's
+        # Shape computation issue events on ANE).
+        h = self.fc(s).view(B, 2 * self.num_features, 1, 1)
+        gamma, beta = torch.chunk(h, chunks=2, dim=1)
+        return (1.0 + gamma) * x_norm + beta
+
+
 class AdaINResBlock1(nn.Module):
+    # Rank-4 residual block used by the Generator. Operates on (B, C, 1, T)
+    # tensors so the surrounding Generator stack stays ANE-aligned end to end
+    # (see README/Plans/ane-decoder-har-rank4-rewrite-v1.md).
+    #
+    # Conv1d → Conv2d((1, k), dilation=(1, d), padding=(0, p)). Snake1D alpha
+    # parameters are stored as (1, C, 1, 1). AdaIN normalization uses the
+    # rank-4 ``AdaIN2d`` sibling — ``AdaIN1d`` (rank-3) is kept untouched for
+    # the Decoder path's ``AdainResBlk1d``.
+    #
+    # A ``register_load_state_dict_pre_hook`` reshapes rank-3
+    # ``hexgrad/Kokoro-82M`` checkpoint tensors to rank-4 idempotently so
+    # pretrained weights load without retraining. See
+    # ``_rank3_to_rank4_conv_state_dict`` for the shared reshape utility.
+
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5), style_dim=64):
         super(AdaINResBlock1, self).__init__()
         self.convs1 = nn.ModuleList([
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
-                                  padding=get_padding(kernel_size, dilation[0]))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[1],
-                                  padding=get_padding(kernel_size, dilation[1]))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[2],
-                                  padding=get_padding(kernel_size, dilation[2])))
+            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
+                                  dilation=(1, dilation[0]),
+                                  padding=(0, get_padding(kernel_size, dilation[0])))),
+            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
+                                  dilation=(1, dilation[1]),
+                                  padding=(0, get_padding(kernel_size, dilation[1])))),
+            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
+                                  dilation=(1, dilation[2]),
+                                  padding=(0, get_padding(kernel_size, dilation[2])))),
         ])
         self.convs1.apply(init_weights)
         self.convs2 = nn.ModuleList([
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                                  padding=get_padding(kernel_size, 1))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                                  padding=get_padding(kernel_size, 1))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                                  padding=get_padding(kernel_size, 1)))
+            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
+                                  dilation=(1, 1),
+                                  padding=(0, get_padding(kernel_size, 1)))),
+            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
+                                  dilation=(1, 1),
+                                  padding=(0, get_padding(kernel_size, 1)))),
+            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
+                                  dilation=(1, 1),
+                                  padding=(0, get_padding(kernel_size, 1)))),
         ])
         self.convs2.apply(init_weights)
         self.adain1 = nn.ModuleList([
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
+            AdaIN2d(style_dim, channels),
+            AdaIN2d(style_dim, channels),
+            AdaIN2d(style_dim, channels),
         ])
         self.adain2 = nn.ModuleList([
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
-            AdaIN1d(style_dim, channels),
+            AdaIN2d(style_dim, channels),
+            AdaIN2d(style_dim, channels),
+            AdaIN2d(style_dim, channels),
         ])
-        self.alpha1 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for i in range(len(self.convs1))])
-        self.alpha2 = nn.ParameterList([nn.Parameter(torch.ones(1, channels, 1)) for i in range(len(self.convs2))])
+        self.alpha1 = nn.ParameterList(
+            [nn.Parameter(torch.ones(1, channels, 1, 1)) for _ in range(len(self.convs1))]
+        )
+        self.alpha2 = nn.ParameterList(
+            [nn.Parameter(torch.ones(1, channels, 1, 1)) for _ in range(len(self.convs2))]
+        )
+
+        self._register_load_state_dict_pre_hook(self._reshape_rank3_to_rank4_hook)
+
+    @staticmethod
+    def _reshape_rank3_to_rank4_hook(state_dict, prefix, *_args, **_kwargs):
+        # Pretrained kokoro-v1_0.pth was saved with Conv1d weights ((C,C,k))
+        # and Snake1D alpha ((1,C,1)). Reshape to Conv2d ((C,C,1,k)) and
+        # (1,C,1,1) idempotently so checkpoints load without retraining.
+        conv_module_paths = [f"convs1.{i}" for i in range(3)] + [f"convs2.{i}" for i in range(3)]
+        alpha_param_paths = [f"alpha1.{i}" for i in range(3)] + [f"alpha2.{i}" for i in range(3)]
+        _rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha_param_paths)
 
     def forward(self, x, s):
+        # x: (B, C, 1, T), s: (B, style_dim) — returns (B, C, 1, T)
         for c1, c2, n1, n2, a1, a2 in zip(self.convs1, self.convs2, self.adain1, self.adain2, self.alpha1, self.alpha2):
             xt = n1(x, s)
             xt = xt + (1 / a1) * (torch.sin(a1 * xt) ** 2)  # Snake1D
@@ -389,6 +532,26 @@ class SourceModuleHnNSF(nn.Module):
 
 
 class Generator(nn.Module):
+    # Rank-4 vocoder Generator. The internal convolution / AdaIN stack operates
+    # on ``(B, C, 1, T)`` tensors so the entire body is ANE-aligned (see
+    # README/Plans/ane-decoder-har-rank4-rewrite-v1.md and CLAUDE.md Part 4.1
+    # on the last-axis-largest rule). The public ``forward(x, s, f0)`` signature
+    # still consumes and returns **rank-3** tensors at the module boundary —
+    # the rank promotion happens internally so callers like
+    # ``Decoder.forward`` (kokoro/istftnet.py::Decoder) and any other rank-3
+    # consumers are unchanged. ``GeneratorFromHar`` (export_synth/wrappers.py)
+    # is the inference entry point that the CoreML export traces; it mirrors
+    # this same rank-3 → rank-4 → rank-3 boundary pattern.
+    #
+    # ``noise_convs``, ``ups``, ``conv_post``, ``reflection_pad`` are rank-4
+    # versions of their Conv1d / ConvTranspose1d / ReflectionPad1d counterparts.
+    # ``resblocks`` and ``noise_res`` hold rank-4 ``AdaINResBlock1`` instances
+    # which in turn use rank-4 ``AdaIN2d``.
+    #
+    # A ``register_load_state_dict_pre_hook`` reshapes the pretrained kokoro
+    # checkpoint's rank-3 weights to rank-4 idempotently (see
+    # ``_rank3_to_rank4_conv_state_dict``).
+
     def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=False):
         super(Generator, self).__init__()
         self.num_kernels = len(resblock_kernel_sizes)
@@ -403,8 +566,8 @@ class Generator(nn.Module):
         self.ups = nn.ModuleList()
         for i, (u, k) in enumerate(zip(upsample_rates, upsample_kernel_sizes)):
             self.ups.append(weight_norm(
-                nn.ConvTranspose1d(upsample_initial_channel//(2**i), upsample_initial_channel//(2**(i+1)),
-                                   k, u, padding=(k-u)//2)))
+                nn.ConvTranspose2d(upsample_initial_channel//(2**i), upsample_initial_channel//(2**(i+1)),
+                                   (1, k), (1, u), padding=(0, (k-u)//2))))
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
             ch = upsample_initial_channel//(2**(i+1))
@@ -413,32 +576,63 @@ class Generator(nn.Module):
             c_cur = upsample_initial_channel // (2 ** (i + 1))
             if i + 1 < len(upsample_rates):
                 stride_f0 = math.prod(upsample_rates[i + 1:])
-                self.noise_convs.append(nn.Conv1d(
-                    gen_istft_n_fft + 2, c_cur, kernel_size=stride_f0 * 2, stride=stride_f0, padding=(stride_f0+1) // 2))
+                self.noise_convs.append(nn.Conv2d(
+                    gen_istft_n_fft + 2, c_cur,
+                    kernel_size=(1, stride_f0 * 2),
+                    stride=(1, stride_f0),
+                    padding=(0, (stride_f0+1) // 2)))
                 self.noise_res.append(AdaINResBlock1(c_cur, 7, [1,3,5], style_dim))
             else:
-                self.noise_convs.append(nn.Conv1d(gen_istft_n_fft + 2, c_cur, kernel_size=1))
+                self.noise_convs.append(nn.Conv2d(gen_istft_n_fft + 2, c_cur, kernel_size=(1, 1)))
                 self.noise_res.append(AdaINResBlock1(c_cur, 11, [1,3,5], style_dim))
         self.post_n_fft = gen_istft_n_fft
-        self.conv_post = weight_norm(nn.Conv1d(ch, self.post_n_fft + 2, 7, 1, padding=3))
+        self.conv_post = weight_norm(nn.Conv2d(ch, self.post_n_fft + 2, (1, 7), (1, 1), padding=(0, 3)))
         self.ups.apply(init_weights)
         self.conv_post.apply(init_weights)
-        self.reflection_pad = nn.ReflectionPad1d((1, 0))
+        # ReflectionPad2d args are (left, right, top, bottom); H axis gets 0/0.
+        self.reflection_pad = nn.ReflectionPad2d((1, 0, 0, 0))
         self.stft = (
             CustomSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
             if disable_complex
             else TorchSTFT(filter_length=gen_istft_n_fft, hop_length=gen_istft_hop_size, win_length=gen_istft_n_fft)
         )
 
+        self._register_load_state_dict_pre_hook(self._reshape_rank3_to_rank4_hook)
+
+    def _reshape_rank3_to_rank4_hook(self, state_dict, prefix, *_args, **_kwargs):
+        # Pretrained kokoro-v1_0.pth has Conv1d weights at noise_convs.* /
+        # ConvTranspose1d weights at ups.* / Conv1d weights at conv_post.
+        # Reshape to Conv2d / ConvTranspose2d shapes idempotently so pretrained
+        # weights load without retraining. resblocks and noise_res have their
+        # own pre-hooks on each AdaINResBlock1 instance — PyTorch recurses
+        # into children automatically.
+        conv_module_paths: list[str] = []
+        conv_module_paths.extend(f"ups.{i}" for i in range(len(self.ups)))
+        conv_module_paths.extend(f"noise_convs.{i}" for i in range(len(self.noise_convs)))
+        conv_module_paths.append("conv_post")
+        _rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha_param_paths=[])
+
     def forward(self, x, s, f0):
+        # Inputs:
+        #   x:   (B, C, T_in)   — rank-3 from upstream
+        #   s:   (B, style_dim) — rank-2 style vector
+        #   f0:  (B, T_f0)      — rank-2 F0 contour
+        # Output:
+        #   waveform (B, T_out) — rank-3 boundary preserved for legacy callers
         with torch.no_grad():
             f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
             har_source, noi_source, uv = self.m_source(f0)
             har_source = har_source.transpose(1, 2).squeeze(1)
             har_spec, har_phase = self.stft.transform(har_source)
-            har = torch.cat([har_spec, har_phase], dim=1)
+            har = torch.cat([har_spec, har_phase], dim=1)  # (B, C_har, T_har)
+
+        # Promote to rank-4 (B, C, 1, T) at the body boundary so the Conv2d /
+        # ConvTranspose2d / AdaIN2d stack stays ANE-aligned end to end.
+        x = x.unsqueeze(-2)      # (B, C, 1, T_in)
+        har = har.unsqueeze(-2)  # (B, C_har, 1, T_har)
+
         for i in range(self.num_upsamples):
-            x = F.leaky_relu(x, negative_slope=0.1) 
+            x = F.leaky_relu(x, negative_slope=0.1)
             x_source = self.noise_convs[i](har)
             x_source = self.noise_res[i](x_source, s)
             x = self.ups[i](x)
@@ -446,12 +640,12 @@ class Generator(nn.Module):
                 x = self.reflection_pad(x)
             # Harmonic branch vs upsampled feature length can differ by a few samples (STFT / conv
             # output rounding). Align before add — required for stable torch.jit.trace and Core ML.
-            tx = x.size(2)
-            ts = x_source.size(2)
+            tx = x.size(-1)
+            ts = x_source.size(-1)
             if ts < tx:
                 x_source = F.pad(x_source, (0, tx - ts))
             elif ts > tx:
-                x_source = x_source[:, :, :tx]
+                x_source = x_source[:, :, :, :tx]
             x = x + x_source
             xs = None
             for j in range(self.num_kernels):
@@ -461,8 +655,9 @@ class Generator(nn.Module):
                     xs += self.resblocks[i*self.num_kernels+j](x, s)
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
-        x = self.conv_post(x)
-        spec = torch.exp(x[:,:self.post_n_fft // 2 + 1, :])
+        x = self.conv_post(x)        # (B, post_n_fft + 2, 1, T_post)
+        x = x.squeeze(-2)            # drop H=1; iSTFT expects rank-3
+        spec = torch.exp(x[:, :self.post_n_fft // 2 + 1, :])
         phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
         return self.stft.inverse(spec, phase)
 

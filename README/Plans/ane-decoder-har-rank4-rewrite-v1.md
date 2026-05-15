@@ -434,7 +434,7 @@ numerical equivalence in PyTorch before touching Core ML.
 
 **Tasks (`kokoro/istftnet.py`):**
 
-- [ ] Add new class `AdaIN2d` next to
+- [x] Add new class `AdaIN2d` next to
   [`AdaIN1d` at line 98](../../kokoro/istftnet.py#L98). API:
   `forward(x, s)` where `x` is `(B, C, 1, T)`, `s` is `(B, style_dim)`,
   output is `(B, C, 1, T)`. Implementation:
@@ -453,7 +453,7 @@ numerical equivalence in PyTorch before touching Core ML.
     "Shape computation issue" in the rank-3 graph).
   - **Do not** modify the original `AdaIN1d`. It stays untouched for
     the Decoder path's `AdainResBlk1d`.
-- [ ] Convert `AdaINResBlock1` (
+- [x] Convert `AdaINResBlock1` (
   [line 153](../../kokoro/istftnet.py#L153)) to rank-4:
   - `self.convs1` / `self.convs2`: `nn.Conv1d(C, C, k, 1, dilation=d, padding=p)`
     → `nn.Conv2d(C, C, (1, k), 1, dilation=(1, d), padding=(0, p))`.
@@ -462,7 +462,7 @@ numerical equivalence in PyTorch before touching Core ML.
   - Forward: same control flow, no shape changes needed — convs and
     AdaIN are now rank-4 native; `torch.sin(a * xt) ** 2` works
     elementwise on rank-4.
-- [ ] Convert `Generator` (
+- [x] Convert `Generator` (
   [line 391](../../kokoro/istftnet.py#L391)) to rank-4:
   - `self.noise_convs`: `nn.Conv1d(...)` →
     `nn.Conv2d(..., kernel_size=(1, k), stride=(1, stride_f0), padding=(0, (stride_f0+1)//2))`
@@ -474,13 +474,22 @@ numerical equivalence in PyTorch before touching Core ML.
   - `self.reflection_pad`: `nn.ReflectionPad1d((1, 0))` →
     `nn.ReflectionPad2d((1, 0, 0, 0))` (PyTorch's 2d pad is
     `(left, right, top, bottom)`).
-  - Forward: leave alone — `Generator.forward` is the training path that
-    operates on a rank-3 `(B, C, T)` upstream; **`GeneratorFromHar` is
-    the inference entry point that does the rank-4 promotion**. If
-    `Generator.forward` is also traced from anywhere
-    (`export_synth/convert.py` `mode == "full"` for instance), wrap with
-    its own rank-3 → rank-4 → rank-3 squeeze/unsqueeze adapter.
-- [ ] Add a module-level helper `_rank3_to_rank4_conv_state_dict` next to
+  - **Deviation from original plan, made in Phase 1c (2026-05-15):**
+    `Generator.forward` is NOT left alone — it now does the rank-3 →
+    rank-4 → rank-3 promotion internally. Reason: `Decoder.forward` at
+    [`kokoro/istftnet.py::Decoder` line 562](../../kokoro/istftnet.py#L562)
+    calls `self.generator(x, s, F0_curve)` with rank-3 `x`, so leaving
+    `Generator.forward` rank-3 while the inner modules are rank-4 would
+    have broken the Decoder path (which is in-scope to keep working).
+    The boundary pattern in `Generator.forward` is identical to
+    `GeneratorFromHar.forward`: `unsqueeze(-2)` on `x` and `har` at the
+    body entry, `squeeze(-2)` on `x` after `conv_post`, then the existing
+    rank-3 spec/phase slicing + `stft.inverse` call. The integration
+    test
+    [`tests/test_export_wrappers_shapes.py::test_synthesizer_model_forward_runs_and_returns_1d_audio`](../../tests/test_export_wrappers_shapes.py)
+    exercises this Decoder → Generator path and passes after the
+    rewrite.
+- [x] Add a module-level helper `_rank3_to_rank4_conv_state_dict` next to
   [`AdaIN1d`](../../kokoro/istftnet.py#L98). **Shared with the future
   `decoder_pre` rewrite** — see
   [Retrofit-Readiness for `decoder_pre` Rewrite](#retrofit-readiness-for-decoder_pre-rewrite).
@@ -505,7 +514,7 @@ numerical equivalence in PyTorch before touching Core ML.
   Caller modules supply their own key lists, so the helper has no
   knowledge of `AdaINResBlock1` vs `AdainResBlk1d` and can be reused
   verbatim in the follow-on decoder_pre plan.
-- [ ] Register `register_load_state_dict_pre_hook` on `AdaINResBlock1`
+- [x] Register `register_load_state_dict_pre_hook` on `AdaINResBlock1`
   and `Generator` that calls the shared helper with the key lists for
   this plan's modules:
   - `AdaINResBlock1` keys: `convs1.0.weight`, `convs1.1.weight`,
@@ -523,7 +532,7 @@ numerical equivalence in PyTorch before touching Core ML.
 
 **Tasks (`export_synth/wrappers.py`):**
 
-- [ ] Convert
+- [x] Convert
   [`GeneratorFromHar.forward`](../../export_synth/wrappers.py#L87) to
   rank-4 internally. Inputs stay rank-3 / rank-2 at the boundary:
   - Entry: `x = x_pre.unsqueeze(-2)`,
@@ -542,37 +551,57 @@ numerical equivalence in PyTorch before touching Core ML.
   - Exit: `x = gen.conv_post(x)` produces rank-4 `(B, n_fft+2, 1, T)`;
     `x = x.squeeze(-2)` produces rank-3 `(B, n_fft+2, T)`; rest of the
     code (spec/phase slicing + `gen.stft.inverse`) is unchanged.
-- [ ] Document the rank promotion at the top of `GeneratorFromHar` so a
+- [x] Document the rank promotion at the top of `GeneratorFromHar` so a
   future reader sees the rank-4 internal invariant explicitly (LLM-first
   doc style per [CLAUDE.md](../../CLAUDE.md)).
 
 **Tasks (tests):**
 
-- [ ] Add `tests/test_adain2d_vs_adain1d.py`: rank-3 `AdaIN1d` reference
+- [x] Add `tests/test_adain2d_vs_adain1d.py`: rank-3 `AdaIN1d` reference
   vs rank-4 `AdaIN2d` on synthetic `(B, C, T)` input
   (unsqueezed/squeezed for the rank-4 path);
   `torch.allclose(rank3_out, rank4_out.squeeze(-2), atol=1e-5, rtol=1e-5)`.
-- [ ] Add `tests/test_generator_from_har_rank4.py`: rank-3 `GeneratorFromHar`
-  reference vs rank-4 rewrite on real `(x_pre, ref_s, har)` inputs
-  produced by
-  [`kokoro.synthesis_backends.build_decoder_har_post_inputs_np`](../../kokoro/synthesis_backends.py)
-  (or its existing usage in
-  [`scripts/bench_decoder_har_post_predict.py`](../../scripts/bench_decoder_har_post_predict.py));
-  Pearson > 0.99999 and max abs Δ < 1e-5 on PyTorch fp32 — much tighter
-  tolerance than the Core ML cross-runtime gate because we're comparing
-  PyTorch-to-PyTorch.
-- [ ] Add `tests/test_rank4_checkpoint_load.py`: load real
+  **Done:** 5 tests cover the (channels, style_dim, seq_len) matrix
+  `[(128, 128, 64), (256, 128, 128), (128, 64, 32)]` plus AdaIN2d's
+  H=1-axis and channel-mismatch assertions.
+- [ ] **Deferred to Phase 2 (waveform parity gate)** — `tests/test_generator_from_har_rank4.py`:
+  rank-3 `GeneratorFromHar` reference vs rank-4 rewrite on real inputs.
+  **Deviation:** the rank-3 `GeneratorFromHar` reference no longer
+  exists in-process (it was overwritten by the rank-4 rewrite, by
+  design — the boundary preserves the rank-3 public API but the body
+  is rank-4 only). An in-process diff would require restoring rank-3
+  code as a separate class, which contradicts the
+  "do not duplicate AdaIN2d" decision in
+  [Open Questions §Resolved](#resolved). The cross-runtime parity gate
+  in [Phase 2](#phase-2-re-export-kokoro_decoder_har_post_3s10smlpackage)
+  via
+  [`scripts/compare_decoder_har_post_waveforms.py`](../../scripts/compare_decoder_har_post_waveforms.py)
+  against the pre-rewrite `/tmp/...baseline.mlpackage` files is the
+  actual numerical parity check (Pearson > 0.99, SNR ≥ 40 dB, max abs
+  Δ ≤ 1e-2). The Phase 1 smoke gate at
+  `tests/test_rank4_checkpoint_load.py::test_rank4_generator_forward_after_load_is_finite`
+  covers the "forward runs and is finite" end of the test pyramid.
+- [x] Add `tests/test_rank4_checkpoint_load.py`: load real
   `hexgrad/Kokoro-82M` checkpoint (the same one
   `export_synth/main.py` loads) into the rank-4 Generator; assert no
-  missing keys, no unexpected keys, and a forward pass on synthetic
-  rank-4 input is finite.
-- [ ] Re-run the existing
+  missing keys (excluding `stft.*` internal buffers which were never
+  in the checkpoint), no unexpected keys, and a forward pass on
+  synthetic rank-4 input is finite. **Done:** 2 tests; both pass when
+  the HF snapshot is cached locally and skip otherwise.
+- [x] Re-run the existing
   [`tests/test_adain1d_decoder_smoke.py`](../../tests/test_adain1d_decoder_smoke.py)
   and
   [`tests/test_export_wrappers_shapes.py`](../../tests/test_export_wrappers_shapes.py)
   to confirm the Decoder path is unaffected (since `AdaIN1d` is
   unchanged and only the Generator path moved to `AdaIN2d`).
-- [ ] `uv run pytest tests/` — full suite green.
+  **Done:** both files green;
+  `test_synthesizer_model_forward_runs_and_returns_1d_audio` in
+  particular exercises the full Decoder → Generator path through the
+  new rank-3 → rank-4 → rank-3 boundary.
+- [x] `uv run python -m pytest tests/ -q` — full suite green.
+  **2026-05-15:** 41 passed, 9 skipped, 0 failed. Skips are
+  environment-conditional (decoder_pre / decoder_only / kokoro_duration
+  mlpackages not on disk; Phase 2 re-export work).
 
 **Verification:** PyTorch parity tests pass at fp32 tolerance; full
 pytest green; pretrained checkpoint loads with no missing/unexpected
