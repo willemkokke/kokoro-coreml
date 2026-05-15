@@ -315,8 +315,8 @@ the call site (cheap), and remeasure the .all / .gpu / .ne triplet.
 Reproduces on M3 Max running macOS 26.x with Xcode + uv installed.
 
 ```bash
-# From a clean checkout of main:
-cd /Users/willem/Documents/Repositories/kokoro-coreml-ane
+# From a clean checkout of the kokoro-coreml-ane repo:
+cd "$(git rev-parse --show-toplevel)"   # or your checkout root
 uv sync
 
 # Export the 10s decoder-har-post package.
@@ -359,3 +359,16 @@ goes ahead, the probe + dump scripts should be hardened and moved under
 - [ANE Graph Optimization Plan](../Plans/ane-optimization-v1.md) — Phase 0/1/3 linear-vs-conv work that preceded this investigation.
 - [Core ML Compute Unit Scheduling Guide](../Guides/apple-silicon/CoreML-Compute-Unit-Scheduling-guide.md) — documented `.all` / `.cpuAndGPU` / `.cpuAndNeuralEngine` semantics + silent fallback reference.
 - [CLAUDE.md, Part 4.1 — ANE memory layout](../../CLAUDE.md) — `(B, C, 1, T)` rule with `T` largest; 64-byte last-axis alignment penalty.
+
+## Resolution status
+
+The §5 Recommendation here was executed as the rank-4 rewrite tracked in
+[`README/Plans/ane-decoder-har-rank4-rewrite-v1.md`](../Plans/ane-decoder-har-rank4-rewrite-v1.md).
+**Outcome:** rank-4 alone is necessary but not sufficient on M3 Max /
+macOS 26.4 / `ct.target.macOS13`. ANE engagement is still 0 / 948 in
+Xcode; however the rewrite kept independent wins (shape-inference
+disqualifier resolved, `.all` cold-load 26.5 s → 1.075 s, MIL ops
+2207 → 2021 with `tile` 96 → 0, full waveform parity). The HAR-on-ANE
+investigation continues in that same plan's
+[Iteration 2 section](../Plans/ane-decoder-har-rank4-rewrite-v1.md#iteration-2-coremltools-90-upgrade--latest-target)
+(coremltools 9.0 + latest target).

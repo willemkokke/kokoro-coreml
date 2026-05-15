@@ -96,42 +96,14 @@ class GeneratorFromHar(nn.Module):
         self.generator = generator
 
     def forward(self, x_pre: torch.Tensor, ref_s: torch.Tensor, har: torch.Tensor) -> torch.Tensor:
+        # Slice the baseline-dim style vector out of the full voice embedding.
+        # ``s`` stays rank-2 (B, style_dim); AdaIN2d projects to rank-4
+        # internally via ``.view``, so no rank promotion is needed here.
         s = ref_s[:, : CoreMLExportConstants.VOICE_BASELINE_DIM]
-        gen = self.generator
-
-        # Promote to rank-4 (B, C, 1, T) at the body boundary. ``ref_s`` /
-        # ``s`` stays rank-2 (B, style_dim) — AdaIN2d projects to rank-4
-        # internally via .view, no boundary change needed.
-        x = x_pre.unsqueeze(-2)   # (B, 512, 1, T_asr)
-        har = har.unsqueeze(-2)   # (B, C_har, 1, T_har)
-
-        for i in range(gen.num_upsamples):
-            x = F.leaky_relu(x, negative_slope=0.1)
-            x_source = gen.noise_convs[i](har)
-            x_source = gen.noise_res[i](x_source, s)
-            x = gen.ups[i](x)
-            if i == gen.num_upsamples - 1:
-                x = gen.reflection_pad(x)
-            tx = x.size(-1)
-            ts = x_source.size(-1)
-            if ts < tx:
-                x_source = F.pad(x_source, (0, tx - ts))
-            elif ts > tx:
-                x_source = x_source[:, :, :, :tx]
-            x = x + x_source
-            xs = None
-            for j in range(gen.num_kernels):
-                if xs is None:
-                    xs = gen.resblocks[i * gen.num_kernels + j](x, s)
-                else:
-                    xs = xs + gen.resblocks[i * gen.num_kernels + j](x, s)
-            x = xs / gen.num_kernels
-        x = F.leaky_relu(x)
-        x = gen.conv_post(x)         # (B, post_n_fft + 2, 1, T_post)
-        x = x.squeeze(-2)            # drop H=1; iSTFT.inverse expects rank-3
-        spec = torch.exp(x[:, : gen.post_n_fft // 2 + 1, :])
-        phase = torch.sin(x[:, gen.post_n_fft // 2 + 1 :, :])
-        return gen.stft.inverse(spec, phase)
+        # Delegate the rank-3 → rank-4 → rank-3 vocoder body to ``Generator``.
+        # The body is shared with ``Generator.forward`` so the two stay in
+        # lockstep (see ``kokoro/istftnet.py::Generator.vocoder_body``).
+        return self.generator.vocoder_body(x_pre, s, har)
 
 class CoreMLFriendlyTextEncoder(nn.Module):
     """Replaces the original TextEncoder to avoid pack_padded_sequence."""

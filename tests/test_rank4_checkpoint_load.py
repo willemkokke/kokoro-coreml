@@ -5,7 +5,7 @@ rank-3 alpha parameters to rank-4 idempotently.
 
 This is the checkpoint-compat gate for the rank-3 → rank-4 rewrite. See
 ``README/Plans/ane-decoder-har-rank4-rewrite-v1.md`` Phase 1 and the shared
-``kokoro.istftnet._rank3_to_rank4_conv_state_dict`` helper.
+``kokoro.istftnet.rank3_to_rank4_conv_state_dict`` helper.
 
 The kokoro checkpoint is at
 ``~/.cache/huggingface/hub/models--hexgrad--Kokoro-82M/snapshots/*/kokoro-v1_0.pth``
@@ -114,8 +114,11 @@ def test_rank4_generator_forward_after_load_is_finite():
     x = torch.clamp(torch.randn(B, 512, T_asr, dtype=torch.float32) * 0.02, -0.05, 0.05)
     s = torch.randn(B, style_dim, dtype=torch.float32) * 0.01
     # f0_upsamp scale = math.prod([10, 6]) * 5 = 300; pick a length that
-    # multiplies cleanly so transposed conv shapes line up.
-    f0 = torch.zeros(B, T_asr * 2, dtype=torch.float32)
+    # multiplies cleanly so transposed conv shapes line up. Use a NON-zero F0
+    # (220 Hz, A3) so SourceModuleHnNSF's sine generator produces an actual
+    # harmonic source — an all-zero F0 leaves only the noise branch active
+    # and would not catch a Snake1D / AdaIN2d sign-flip regression.
+    f0 = torch.full((B, T_asr * 2), 220.0, dtype=torch.float32)
 
     with torch.no_grad():
         wave = gen(x, s, f0)
@@ -123,3 +126,12 @@ def test_rank4_generator_forward_after_load_is_finite():
     assert torch.isfinite(wave).all(), "rank-4 Generator output is non-finite"
     # iSTFT returns rank-3 (B, 1, samples); cope with either layout.
     assert wave.dim() in (2, 3), f"unexpected output rank {wave.dim()}"
+    # Non-trivial-output gate: the all-finite check passes for an all-zero
+    # output too. Require the waveform to have non-trivial energy so a bug
+    # that zeroes intermediate activations (e.g. AdaIN2d returning x_norm
+    # only, or Snake1D dropping the sine term) cannot pass silently.
+    waveform_rms = torch.sqrt((wave.float() ** 2).mean()).item()
+    assert waveform_rms > 1e-4, (
+        f"rank-4 Generator output has near-zero RMS ({waveform_rms:.3e}); "
+        f"likely a silently-zeroed activation path"
+    )

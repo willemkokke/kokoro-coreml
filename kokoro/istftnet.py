@@ -98,6 +98,17 @@ def get_padding(kernel_size, dilation=1):
 class AdaIN1d(nn.Module):
     # Adaptive Instance Normalization for 1D sequences with style conditioning.
     #
+    # **Rank-3 contract.** This module consumes ``(B, C, T)`` tensors and is the
+    # AdaIN used by ``AdainResBlk1d`` (Decoder path). It is **intentionally
+    # distinct** from ``AdaIN2d`` (rank-4, Generator path) below; do **not**
+    # merge or refactor the two into a shared class. The two paths export to
+    # different Core ML packages with different ANE-alignment requirements —
+    # the rank-3 Decoder path keeps AdaIN1d untouched as a frozen contract; the
+    # rank-4 Generator path uses AdaIN2d. Merging them couples HAR-post and
+    # decoder_pre rewrites in a way the rank-4 plan explicitly avoids (see
+    # ``README/Plans/ane-decoder-har-rank4-rewrite-v1.md`` Open Questions §
+    # "Should AdaIN1d be rewritten in place...?").
+    #
     # This module implements style-conditioned normalization that adapts
     # the normalization statistics based on voice characteristics. It's a
     # key component enabling voice cloning and style transfer capabilities.
@@ -110,13 +121,22 @@ class AdaIN1d(nn.Module):
     # Manual channel-wise normalization (no nn.InstanceNorm1d) avoids exporter
     # shape/broadcast bugs and keeps the MIL graph clean for ANE tracing.
     #
+    # Note: gamma/beta are explicitly ``.expand``ed across T (see forward
+    # below). The rank-4 sibling ``AdaIN2d`` drops the explicit expand and
+    # relies on implicit broadcasting — that change is **only safe at rank 4**
+    # (it triggers Espresso "Shape computation issue" events at rank 3 on
+    # macOS 26 ANE compilers; see the iteration-1 Phase 3 evidence in the
+    # rank-4 plan). Keep the explicit expand here.
+    #
     # Parameters:
     # - style_dim: Dimension of input style vector (typically 128)
     # - num_features: Number of channels to normalize
     #
     # Used by:
-    # - AdaINResBlock1: Style-conditioned residual processing
-    # - Generator architecture: Voice adaptation throughout the network
+    # - AdainResBlk1d (kokoro/istftnet.py, Decoder path) — frozen rank-3
+    #   contract.
+    # - Generator (legacy, pre-rank-4): no longer used; ``AdaINResBlock1`` now
+    #   uses ``AdaIN2d`` instead.
     #
     def __init__(self, style_dim, num_features):
         super().__init__()
@@ -150,7 +170,7 @@ class AdaIN1d(nn.Module):
         return (1.0 + gamma_exp) * x_norm + beta_exp
 
 
-def _rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha_param_paths):
+def rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha_param_paths):
     """Idempotently reshape rank-3 conv weights and rank-3 alpha params to rank-4
     inside a state_dict, supporting bare and weight_norm-wrapped (legacy and new
     parametrizations API) forms.
@@ -159,6 +179,12 @@ def _rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha
     so the pretrained rank-3 ``hexgrad/Kokoro-82M`` checkpoint loads into the
     rank-4 modules introduced for ANE alignment (see
     ``README/Plans/ane-decoder-har-rank4-rewrite-v1.md``).
+
+    Designed as a public cross-module utility: the follow-on ``decoder_pre``
+    rank-4 plan (``ane-decoder-pre-rank4-rewrite-v1.md``) will call it from
+    ``AdainResBlk1d``'s load hook with its own key lists. The name is
+    intentionally unprefixed so cross-module callers don't have to reach across
+    a single-underscore boundary.
 
     Args:
         state_dict: dict being loaded (mutated in place).
@@ -178,10 +204,12 @@ def _rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha
             alpha parameters (e.g. ``"alpha1.0"``). 3D ``(1, C, 1)`` becomes 4D
             ``(1, C, 1, 1)`` via ``.unsqueeze(-1)``; 4D tensors pass through.
 
-    Designed for reuse by the follow-on ``decoder_pre`` rank-4 plan
-    (``ane-decoder-pre-rank4-rewrite-v1.md``) — `AdainResBlk1d`'s rank-4 rewrite
-    will call this helper with its own ``conv_module_paths`` /
-    ``alpha_param_paths`` lists.
+    Raises:
+        AssertionError: if any matched tensor has a rank other than 3 or 4
+            (the only two ranks this helper is intended to handle). Catching
+            rank-2 or rank-5 surprises here gives a clear diagnostic; the
+            alternative is a confusing shape mismatch deep inside
+            ``load_state_dict``.
     """
     weight_suffixes = (
         "weight",
@@ -194,30 +222,54 @@ def _rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha
         for weight_suffix in weight_suffixes:
             key = f"{prefix}{module_path}.{weight_suffix}"
             t = state_dict.get(key)
-            if t is not None and t.dim() == 3:
+            if t is None:
+                continue
+            assert t.dim() in (3, 4), (
+                f"rank3_to_rank4_conv_state_dict: expected rank 3 or 4 for {key!r}, "
+                f"got rank {t.dim()} shape {tuple(t.shape)}"
+            )
+            if t.dim() == 3:
                 state_dict[key] = t.unsqueeze(-2)
     for param_path in alpha_param_paths:
         key = f"{prefix}{param_path}"
         t = state_dict.get(key)
-        if t is not None and t.dim() == 3:
+        if t is None:
+            continue
+        assert t.dim() in (3, 4), (
+            f"rank3_to_rank4_conv_state_dict: expected rank 3 or 4 for alpha param "
+            f"{key!r}, got rank {t.dim()} shape {tuple(t.shape)}"
+        )
+        if t.dim() == 3:
             state_dict[key] = t.unsqueeze(-1)
 
 
 class AdaIN2d(nn.Module):
-    # Rank-4 sibling of ``AdaIN1d`` for the Generator's ANE-aligned rewrite.
+    # Rank-4 AdaIN used by the Generator's ANE-aligned rewrite.
     #
-    # Same math as ``AdaIN1d`` (manual instance norm over time + style-conditioned
-    # gamma/beta) but operating on ``(B, C, 1, T)`` tensors so the surrounding
-    # Conv2d / ConvTranspose2d stack stays rank-4 throughout. This satisfies
-    # Apple's documented ANE preference for last-axis-largest rank-4 shapes
-    # (see CLAUDE.md Part 4.1 and the rank-3 → rank-4 plan at
-    # README/Plans/ane-decoder-har-rank4-rewrite-v1.md).
+    # **Rank-4 contract.** Consumes ``(B, C, 1, T)`` tensors so the surrounding
+    # Conv2d / ConvTranspose2d stack stays rank-4 throughout — Apple's ANE
+    # prefers last-axis-largest rank-4 layouts (see CLAUDE.md Part 4.1).
     #
-    # **Deliberately distinct from AdaIN1d.** ``AdaIN1d`` keeps a rank-3 contract
-    # for the Decoder path (``AdainResBlk1d``). Merging the two classes would
-    # couple HAR-post and decoder_pre export rewrites — see Risks and Mitigations
-    # in the rank-4 plan. The decoder_pre follow-on will reuse this same
-    # ``AdaIN2d`` (not introduce a parallel rank-4 AdaIN).
+    # **Intentionally distinct from ``AdaIN1d`` above.** Same math (manual
+    # instance norm over time + style-conditioned gamma/beta) but operating
+    # on a different rank. Do **not** merge or refactor the two into a
+    # shared class. ``AdaIN1d`` is frozen as the rank-3 Decoder contract;
+    # this class is the rank-4 Generator replacement. The 95% code
+    # similarity is acknowledged and intentional — see the corresponding
+    # warning on ``AdaIN1d`` and Risks and Mitigations in the rank-4 plan
+    # (``README/Plans/ane-decoder-har-rank4-rewrite-v1.md``).
+    #
+    # The decoder_pre follow-on plan will reuse this same ``AdaIN2d`` (rank-4)
+    # rather than introduce a parallel rank-4 AdaIN; ``AdaIN1d`` becomes dead
+    # code at that point and can be removed.
+    #
+    # **Note vs ``AdaIN1d``:** AdaIN1d explicitly ``.expand``s gamma/beta over
+    # T to avoid Espresso "Shape computation issue" events on the rank-3
+    # graph. At rank 4 the explicit expand is not needed — PyTorch broadcast
+    # of ``(B, C, 1, 1)`` against ``(B, C, 1, T)`` does not trigger the same
+    # ANE shape-inference pitfall (verified by Phase 3 of the rank-4 plan:
+    # 12 ``Shape computation issue`` events on rank 3 → 0 on rank 4). Keep
+    # the implicit broadcast here; do not copy the explicit expand back.
     #
     # Parameters:
     # - style_dim:    Dimension of input style vector (typically 128).
@@ -270,49 +322,41 @@ class AdaINResBlock1(nn.Module):
     # A ``register_load_state_dict_pre_hook`` reshapes rank-3
     # ``hexgrad/Kokoro-82M`` checkpoint tensors to rank-4 idempotently so
     # pretrained weights load without retraining. See
-    # ``_rank3_to_rank4_conv_state_dict`` for the shared reshape utility.
+    # ``rank3_to_rank4_conv_state_dict`` for the shared reshape utility.
 
     def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5), style_dim=64):
         super(AdaINResBlock1, self).__init__()
+        # convs1: kernel_size, varying dilation per resblock entry.
         self.convs1 = nn.ModuleList([
-            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
-                                  dilation=(1, dilation[0]),
-                                  padding=(0, get_padding(kernel_size, dilation[0])))),
-            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
-                                  dilation=(1, dilation[1]),
-                                  padding=(0, get_padding(kernel_size, dilation[1])))),
-            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
-                                  dilation=(1, dilation[2]),
-                                  padding=(0, get_padding(kernel_size, dilation[2])))),
+            weight_norm(nn.Conv2d(
+                channels, channels, (1, kernel_size), (1, 1),
+                dilation=(1, d),
+                padding=(0, get_padding(kernel_size, d)),
+            ))
+            for d in dilation
         ])
         self.convs1.apply(init_weights)
+        # convs2: dilation=1 always, one Conv2d per convs1 entry.
         self.convs2 = nn.ModuleList([
-            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
-                                  dilation=(1, 1),
-                                  padding=(0, get_padding(kernel_size, 1)))),
-            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
-                                  dilation=(1, 1),
-                                  padding=(0, get_padding(kernel_size, 1)))),
-            weight_norm(nn.Conv2d(channels, channels, (1, kernel_size), (1, 1),
-                                  dilation=(1, 1),
-                                  padding=(0, get_padding(kernel_size, 1)))),
+            weight_norm(nn.Conv2d(
+                channels, channels, (1, kernel_size), (1, 1),
+                dilation=(1, 1),
+                padding=(0, get_padding(kernel_size, 1)),
+            ))
+            for _ in dilation
         ])
         self.convs2.apply(init_weights)
-        self.adain1 = nn.ModuleList([
-            AdaIN2d(style_dim, channels),
-            AdaIN2d(style_dim, channels),
-            AdaIN2d(style_dim, channels),
-        ])
-        self.adain2 = nn.ModuleList([
-            AdaIN2d(style_dim, channels),
-            AdaIN2d(style_dim, channels),
-            AdaIN2d(style_dim, channels),
-        ])
+        self.adain1 = nn.ModuleList(
+            AdaIN2d(style_dim, channels) for _ in dilation
+        )
+        self.adain2 = nn.ModuleList(
+            AdaIN2d(style_dim, channels) for _ in dilation
+        )
         self.alpha1 = nn.ParameterList(
-            [nn.Parameter(torch.ones(1, channels, 1, 1)) for _ in range(len(self.convs1))]
+            [nn.Parameter(torch.ones(1, channels, 1, 1)) for _ in dilation]
         )
         self.alpha2 = nn.ParameterList(
-            [nn.Parameter(torch.ones(1, channels, 1, 1)) for _ in range(len(self.convs2))]
+            [nn.Parameter(torch.ones(1, channels, 1, 1)) for _ in dilation]
         )
 
         self._register_load_state_dict_pre_hook(self._reshape_rank3_to_rank4_hook)
@@ -321,10 +365,13 @@ class AdaINResBlock1(nn.Module):
     def _reshape_rank3_to_rank4_hook(state_dict, prefix, *_args, **_kwargs):
         # Pretrained kokoro-v1_0.pth was saved with Conv1d weights ((C,C,k))
         # and Snake1D alpha ((1,C,1)). Reshape to Conv2d ((C,C,1,k)) and
-        # (1,C,1,1) idempotently so checkpoints load without retraining.
+        # (1,C,1,1) idempotently so checkpoints load without retraining. The
+        # 3-element list lengths match the ``dilation`` triple in __init__
+        # (kokoro uses dilation=(1,3,5)); these hard-coded indices are
+        # AdaINResBlock1's contract with kokoro-v1_0.pth.
         conv_module_paths = [f"convs1.{i}" for i in range(3)] + [f"convs2.{i}" for i in range(3)]
         alpha_param_paths = [f"alpha1.{i}" for i in range(3)] + [f"alpha2.{i}" for i in range(3)]
-        _rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha_param_paths)
+        rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha_param_paths)
 
     def forward(self, x, s):
         # x: (B, C, 1, T), s: (B, style_dim) — returns (B, C, 1, T)
@@ -550,7 +597,7 @@ class Generator(nn.Module):
     #
     # A ``register_load_state_dict_pre_hook`` reshapes the pretrained kokoro
     # checkpoint's rank-3 weights to rank-4 idempotently (see
-    # ``_rank3_to_rank4_conv_state_dict``).
+    # ``rank3_to_rank4_conv_state_dict``).
 
     def __init__(self, style_dim, resblock_kernel_sizes, upsample_rates, upsample_initial_channel, resblock_dilation_sizes, upsample_kernel_sizes, gen_istft_n_fft, gen_istft_hop_size, disable_complex=False):
         super(Generator, self).__init__()
@@ -610,24 +657,33 @@ class Generator(nn.Module):
         conv_module_paths.extend(f"ups.{i}" for i in range(len(self.ups)))
         conv_module_paths.extend(f"noise_convs.{i}" for i in range(len(self.noise_convs)))
         conv_module_paths.append("conv_post")
-        _rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha_param_paths=[])
+        rank3_to_rank4_conv_state_dict(state_dict, prefix, conv_module_paths, alpha_param_paths=[])
 
-    def forward(self, x, s, f0):
-        # Inputs:
-        #   x:   (B, C, T_in)   — rank-3 from upstream
-        #   s:   (B, style_dim) — rank-2 style vector
-        #   f0:  (B, T_f0)      — rank-2 F0 contour
-        # Output:
-        #   waveform (B, T_out) — rank-3 boundary preserved for legacy callers
-        with torch.no_grad():
-            f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
-            har_source, noi_source, uv = self.m_source(f0)
-            har_source = har_source.transpose(1, 2).squeeze(1)
-            har_spec, har_phase = self.stft.transform(har_source)
-            har = torch.cat([har_spec, har_phase], dim=1)  # (B, C_har, T_har)
+    def vocoder_body(self, x, s, har):
+        """Run the rank-4 conv/AdaIN/iSTFT body of the Generator.
 
-        # Promote to rank-4 (B, C, 1, T) at the body boundary so the Conv2d /
-        # ConvTranspose2d / AdaIN2d stack stays ANE-aligned end to end.
+        Both ``Generator.forward`` (training/Decoder path) and
+        ``GeneratorFromHar.forward`` (Core ML inference entry) call this
+        method so the rank-3 → rank-4 → rank-3 boundary lives in exactly
+        one place. Inputs and outputs are rank-3 / rank-2 so callers stay
+        on the original public contract.
+
+        Args:
+            x:   ``(B, C, T_in)`` — pre-vocoder features. Generator gets these
+                 from ``Decoder``; GeneratorFromHar gets them from the
+                 ``x_pre`` input it traces against.
+            s:   ``(B, style_dim)`` — voice style vector.
+            har: ``(B, C_har, T_har)`` — concat of ``[har_spec, har_phase]``
+                 from the F0-driven harmonic-noise source. Computed inside
+                 ``Generator.forward`` (PyTorch CPU); supplied directly as an
+                 input by ``GeneratorFromHar``.
+
+        Returns:
+            Rank-3 waveform from ``self.stft.inverse`` (typically
+            ``(B, 1, T_out)``).
+        """
+        # Promote to rank-4 (B, C, 1, T) so the Conv2d / ConvTranspose2d /
+        # AdaIN2d stack stays ANE-aligned end to end.
         x = x.unsqueeze(-2)      # (B, C, 1, T_in)
         har = har.unsqueeze(-2)  # (B, C_har, 1, T_har)
 
@@ -638,8 +694,9 @@ class Generator(nn.Module):
             x = self.ups[i](x)
             if i == self.num_upsamples - 1:
                 x = self.reflection_pad(x)
-            # Harmonic branch vs upsampled feature length can differ by a few samples (STFT / conv
-            # output rounding). Align before add — required for stable torch.jit.trace and Core ML.
+            # Harmonic branch vs upsampled feature length can differ by a few
+            # samples (STFT / conv output rounding). Align before add —
+            # required for stable torch.jit.trace and Core ML.
             tx = x.size(-1)
             ts = x_source.size(-1)
             if ts < tx:
@@ -650,16 +707,39 @@ class Generator(nn.Module):
             xs = None
             for j in range(self.num_kernels):
                 if xs is None:
-                    xs = self.resblocks[i*self.num_kernels+j](x, s)
+                    xs = self.resblocks[i * self.num_kernels + j](x, s)
                 else:
-                    xs += self.resblocks[i*self.num_kernels+j](x, s)
+                    # Use ``xs = xs + ...`` (not ``+=``) — torch.jit.trace
+                    # prefers non-in-place additions in loop bodies.
+                    xs = xs + self.resblocks[i * self.num_kernels + j](x, s)
             x = xs / self.num_kernels
         x = F.leaky_relu(x)
         x = self.conv_post(x)        # (B, post_n_fft + 2, 1, T_post)
         x = x.squeeze(-2)            # drop H=1; iSTFT expects rank-3
-        spec = torch.exp(x[:, :self.post_n_fft // 2 + 1, :])
-        phase = torch.sin(x[:, self.post_n_fft // 2 + 1:, :])
+        spec = torch.exp(x[:, : self.post_n_fft // 2 + 1, :])
+        phase = torch.sin(x[:, self.post_n_fft // 2 + 1 :, :])
         return self.stft.inverse(spec, phase)
+
+    def forward(self, x, s, f0):
+        # Inputs:
+        #   x:   (B, C, T_in)   — rank-3 from upstream (e.g. ``Decoder``).
+        #   s:   (B, style_dim) — rank-2 style vector.
+        #   f0:  (B, T_f0)      — rank-2 F0 contour.
+        # Output:
+        #   waveform (B, 1, T_out) — rank-3 boundary preserved for legacy
+        #   callers. The rank-4 promotion happens inside ``vocoder_body``.
+        #
+        # The Core ML inference path (``GeneratorFromHar``) bypasses this
+        # method's F0 / m_source / STFT preamble (which is not Core
+        # ML-traceable) and calls ``self.vocoder_body(x_pre, s, har)``
+        # directly with a pre-computed ``har``.
+        with torch.no_grad():
+            f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
+            har_source, noi_source, uv = self.m_source(f0)
+            har_source = har_source.transpose(1, 2).squeeze(1)
+            har_spec, har_phase = self.stft.transform(har_source)
+            har = torch.cat([har_spec, har_phase], dim=1)  # (B, C_har, T_har)
+        return self.vocoder_body(x, s, har)
 
 
 class UpSample1d(nn.Module):

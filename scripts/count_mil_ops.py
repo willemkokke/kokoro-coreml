@@ -161,13 +161,13 @@ def probe_conv_lowering() -> dict:
         (1, 4, 16), (1, 4, 1, 16),
     ))
 
-    # AdaINResBlock1.convs1/convs2 — kernels {3, 7, 11} with dilation {1, 3, 5}
-    # (only the dilation=1 cases for k=7 and k=11; AdaINResBlock1 uses dilation=1
-    # for convs2 across all kernels).
+    # AdaINResBlock1.convs1/convs2 — all 9 combinations of k ∈ {3, 7, 11}
+    # (resblock_kernel_sizes) and d ∈ {1, 3, 5} (resblock_dilation_sizes).
+    # convs1 uses the full (k, d) cross-product; convs2 uses (k, 1) only —
+    # the d=1 cases below cover both convs1's d=1 row AND convs2's full
+    # kernel range with a single probe each.
     for k in (3, 7, 11):
         for d in (1, 3, 5):
-            if d > 1 and k == 1:
-                continue
             padding = (k * d - d) // 2  # matches get_padding in istftnet.py
             cases.append(_probe_pair(
                 f"Conv k={k} dilation={d} (AdaINResBlock1 convs1)",

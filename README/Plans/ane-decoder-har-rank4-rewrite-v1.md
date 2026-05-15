@@ -808,13 +808,18 @@ sufficient on macOS 26.4 / iOS16-target.** See
 - **If Xcode Neural Engine count > 0 but partial (say 30-80% of ops):**
   inspect the residual `Unsupported op` indices via
   `/tmp/ane-investigation/capture_logs.sh` + `dump_mil_ops.py`. Identify
-  which op-types are still rejected. Likely candidates: residual `tile`
-  (96 in the rank-3 baseline; might be reduced by rank-4 broadcast but
-  not eliminated), `slice_by_index` (6 occurrences, related to the
-  `ref_s[:, :128]` style slice and the spec/phase split after
-  conv_post), or boundary `cast`. Open a follow-on plan named
-  `ane-decoder-har-residual-ops-v1.md` to tackle the specific op-types.
-  **Do not** speculatively bundle fp16 inputs into this PR.
+  which op-types are still rejected. Likely candidates on the rank-4
+  graph: boundary `cast` (the fp32→fp16 input casts and the fp16→fp32
+  output cast — the entry-cast hypothesis from
+  [the investigation note §3.3](../Notes/ane-decoder-har-post-investigation.md#33-why-the-entry-cast-is-a-red-herring-not-the-root-cause)),
+  `slice_by_index` (6 occurrences, related to the `ref_s[:, :128]`
+  style slice and the spec/phase split after conv_post), and the new
+  rank-4 boundary ops `expand_dims` (2 at GeneratorFromHar's body
+  entry) / `squeeze` (1 before `stft.inverse`). Open a follow-on plan
+  named `ane-decoder-har-residual-ops-v1.md` to tackle the specific
+  op-types. **Do not** speculatively bundle fp16 inputs into this PR.
+  (Note: residual `tile` is no longer a candidate — Phase 2 confirmed
+  `tile` 96 → 0 on rank-4; see the Resolved entry above.)
 - **If Xcode Neural Engine count is still 0:** Step 4(b) (fp16 input
   dtypes) becomes the next experiment, in its own follow-on plan. Open
   `ane-decoder-har-fp16-inputs-v1.md`. The smoking-gun signal: re-capture
@@ -905,18 +910,25 @@ graph.
   Δ 3.17e-3** (≤ 1e-2). 3s parity not run (no pre-rewrite 3s baseline
   preserved); rank-4 architecture is bucket-agnostic so 10s parity
   covers the architectural claim.
-- [ ] Xcode Performance Report **Neural Engine column count > 0** on
-  `kokoro_decoder_har_post_10s.mlpackage`. **FAILED:** 0 / 948 on
+- [!] Xcode Performance Report **Neural Engine column count > 0** on
+  `kokoro_decoder_har_post_10s.mlpackage`. **FAILED + DEFERRED:** 0 / 948 on
   M3 Max / macOS 26.4. Carried forward to
-  `ane-decoder-har-fp16-inputs-v1.md`.
-- [ ] Python probe: `.all` sha256(out) **differs from** `.cpuAndGPU`
-  sha256(out). Cold-load `.all` ≤ 5 s. **FAILED on the sha-differs
-  half** (both produce `28041dfea5c8b6e1` — silent GPU fallback).
-  **PASSED on the cold-load half** (1.075 s ≤ 5 s).
-- [ ] Espresso `Unsupported op` event count on `.all` load **≤ 50** (down
-  from 322). **FAILED:** 298 events (–24 from rank-3 baseline of 322).
-  Carried forward to `ane-decoder-har-fp16-inputs-v1.md`.
+  [Iteration 2](#iteration-2-coremltools-90-upgrade--latest-target).
+- [!] Python probe: `.all` sha256(out) **differs from** `.cpuAndGPU`
+  sha256(out). Cold-load `.all` ≤ 5 s. **PARTIAL — failed on
+  sha-differs half** (both produce `28041dfea5c8b6e1` — silent GPU
+  fallback persists); **passed on cold-load half** (1.075 s ≤ 5 s).
+- [!] Espresso `Unsupported op` event count on `.all` load **≤ 50** (down
+  from 322). **FAILED + DEFERRED:** 298 events (–24 from rank-3 baseline
+  of 322). Carried forward to
+  [Iteration 2](#iteration-2-coremltools-90-upgrade--latest-target).
+
 - [x] Results-log row appended to this plan.
+
+> Convention: `[x]` = met; `[ ]` = not yet attempted; **`[!]`** = attempted
+> and known-failed/deferred (with the deferral target named inline). A
+> single-character distinction so a checkbox-scan reader doesn't conflate
+> "deferred ANE gate" with "not yet implemented".
 
 ### Definition of Done
 
@@ -995,17 +1007,21 @@ graph.
   ConvTranspose2d lower to the identical MIL op set
   `{cast, const, conv_transpose}`. The Upsample+Conv2d fallback path is
   no longer needed.
-
-### Unresolved
-
 - **Q:** Will `tile` (96 occurrences in rank-3 baseline) drop to zero
   after rank-4, or does some tiling persist (e.g., for repeating the
   style vector along T inside AdaIN2d)?
-- **Options:** Inspect the rank-4 MIL histogram in Phase 3. If `tile`
-  persists and is unsupported on ANE, evaluate whether explicit
-  broadcasting (rely on PyTorch's implicit rank-4 broadcast) can
-  eliminate it. **Current lean:** `tile` drops substantially but not
-  to zero; revisit only if Phase 3 ANE count is partial.
+- **A (resolved 2026-05-15 by Phase 2 MIL diff):** Drops to **zero**.
+  Rank-4 PyTorch broadcasting replaces every `tile` op the rank-3
+  graph used to expand AdaIN gamma/beta over T. AdaIN2d's
+  `gamma`/`beta` of shape `(B, C, 1, 1)` broadcast implicitly against
+  the rank-4 `x_norm` of shape `(B, C, 1, T)` without inserting
+  explicit `tile`. The 10s rank-4 MIL histogram (Phase 2) confirms:
+  `tile` 96 → 0. Cost: 2 new `expand_dims` ops (the unsqueeze(-2) at
+  GeneratorFromHar's body entry) and 1 `squeeze` op (before
+  `stft.inverse`).
+
+### Unresolved
+
 - **Q:** Should this plan move the investigation scratch tools under
   `/tmp/ane-investigation/` (probe.py, capture_logs.sh, dump_mil_ops.py)
   into `scripts/` for permanent reuse?
@@ -1085,7 +1101,7 @@ graph.
 | Baseline (rank-3) | `842473e` | 8.3.0 | 2.6.0 | M3 Max 36 GB | macOS 26.4 | 0 / 1238 | 26.485 | match (silent GPU fallback) | n/a | n/a | 2207 ops; `linear` 48, `conv` 51, `tile` 96 |
 | Rank-4 (Phase 1) | `0186993` | 8.3.0 | 2.5.0 | M3 Max 36 GB | macOS 26.4 | 0 / 948 | 1.075 | match (silent GPU fallback) | 0.999994 | 49.90 dB / 3.17e-3 | 2021 ops; `linear` 48, `conv` 51, `tile` **0** (–96); +`expand_dims` 2, `squeeze` 1 |
 
-## Rollback
+## Iteration 1 Rollback
 
 - **How to revert (Phase 1):** `git revert <conv1d-to-conv2d commit>`
   reverses the module changes. The load hook is idempotent for either
@@ -1097,3 +1113,211 @@ graph.
 - **Time to rollback:** < 5 min for source; ~2 min for re-export.
 - **Data recovery needed:** no. No persistent state outside of the
   Core ML packages and git history.
+
+---
+
+## Iteration 2: coremltools 9.0 upgrade + latest target
+
+**Date:** 2026-05-15
+**Status:** Planned
+**Builds on:** all iteration-1 phases above (rank-4 rewrite landed in
+commits `df830a2..15c8fb1`; ANE engagement gate FAILED on
+`ct.target.macOS13` / iOS 16; cold-load and shape-inference wins
+kept).
+
+### Rationale
+
+Iteration 1 verdict from
+[Conclusion and next iteration](#conclusion-and-next-iteration):
+rank-4 is necessary but not sufficient on M3 Max / macOS 26.4 /
+`ct.target.macOS13`. Xcode `Neural Engine` count still 0 / 948;
+Espresso `Unsupported op` count 298 (down from 322 on rank-3); per-op
+rejection on perfect rank-4 shapes like `1×256×1×8000` confirms the
+rejection is no longer about shape.
+
+Leading remaining hypothesis: macOS 26's ANE compiler refuses the
+ios16 op set for this graph and wants newer op variants. Pinned
+`coremltools==8.3.0` only exposes up to `ct.target.iOS18` — a
+2-version bump from current target. To reach the latest op set
+coremltools supports, iteration 2 upgrades `coremltools` to 9.0
+**first**, then bumps `decoder-har`'s `minimum_deployment_target` to
+the highest enum value 9.0 exposes (expected `iOS19+` /
+`macOS26`-equivalent).
+
+User-stated end goal: once ANE engages at the latest target,
+iteration 3 backward-searches for the **earliest** target that still
+keeps ANE — so the shipping artifact has the broadest OS-floor
+compatible with ANE on M3 Max / macOS 26.
+
+### Scope
+
+- **In scope:**
+  - `coremltools==8.3.0` → `coremltools==9.0` in
+    [`requirements-export.txt`](../../requirements-export.txt), plus
+    any transitive pin 9.0 forces (likely `torch ≥ some-newer-x`).
+  - One-line `target = ct.target.macOS13` →
+    `target = ct.target.<LATEST>` in
+    [`export_synth/convert.py`](../../export_synth/convert.py),
+    scoped to the `decoder-har` mode branch (don't touch `decoder` /
+    `full` modes' targets).
+- **Out of scope:** fp16 input dtypes (Step 4(b), iteration 3
+  territory if needed); `export_decoder_pre.py`'s target;
+  PyTorch-side code; the macOS app's deployment-target lift to
+  match the new package floor (separate downstream concern flagged
+  in Risks).
+
+### Hard gates
+
+- coremltools imports as 9.0.x; `--probe-conv-lowering` still
+  `all_equivalent: true` on 9.0 (Conv2d / ConvTranspose2d / pad
+  still lower to single MIL ops).
+- `uv run python -m pytest tests/` green (no regression vs
+  iteration 1's 41 passed / 9 skipped).
+- Re-exported `coreml/kokoro_decoder_har_post_10s.mlpackage` reports
+  `specificationVersion` higher than 7 (iteration 1's value).
+  Per-op `Type` column in Xcode shows the new target's `ios<N>.*`
+  prefix.
+- Waveform parity vs the rank-4 / ios16 / cml8 baseline saved at
+  `/tmp/kokoro_decoder_har_post_10s.rank4_ios16.mlpackage`:
+  Pearson > 0.99, SNR ≥ 40 dB, max abs Δ ≤ 1e-2.
+- ANE result is either a **stretch success** (Xcode `Neural Engine`
+  count > 0) **or** a **partial-progress hard gate** (Espresso
+  `Unsupported op` count drops to ≤ 100 from 298).
+
+### Phases
+
+**Phase 0 — Tooling upgrade + 9.0 baseline:**
+
+- [ ] Check installability:
+  `uv pip install --dry-run coremltools==9.0`. If 9.0 forces Python
+  / torch upgrades, accept them in `requirements-export.txt` in the
+  same commit. Record the new pins.
+- [ ] Update `requirements-export.txt`. `uv pip install -r
+  requirements-bakeoff.txt`. Verify the upgrade:
+  `uv run python -c "import coremltools as ct; print(ct.__version__)"`.
+- [ ] Enumerate `ct.target` on 9.0; pick the highest enum value.
+  Record the full list in the
+  [Iteration 2 Open Questions](#iteration-2-open-questions) below
+  and lock the chosen target name in Resolved.
+- [ ] Re-run
+  `uv run python scripts/count_mil_ops.py --probe-conv-lowering`.
+  Hard gate: `all_equivalent: true` still holds.
+- [ ] `uv run python -m pytest tests/ -q`. Expected: 41 passed, 9
+  skipped.
+- [ ] Copy the current
+  `coreml/kokoro_decoder_har_post_{3s,10s}.mlpackage` (rank-4 /
+  ios16 / cml8) to
+  `/tmp/kokoro_decoder_har_post_{3s,10s}.rank4_ios16.mlpackage`.
+- [ ] Re-export at the iteration-1 target (still
+  `ct.target.macOS13`) under coremltools 9.0; save as
+  `/tmp/kokoro_decoder_har_post_10s.rank4_ios16_cml9.mlpackage`
+  alongside. Cross-version waveform parity sanity check:
+  `compare_decoder_har_post_waveforms.py
+  --baseline /tmp/...rank4_ios16.mlpackage
+  --candidate /tmp/...rank4_ios16_cml9.mlpackage`. Expect Pearson
+  > 0.999 / SNR > 50 dB; if not, coremltools 9.0 is changing op
+  lowering numerically — investigate before Phase 1.
+
+**Phase 1 — Target bump:**
+
+- [ ] Edit
+  [`export_synth/convert.py`](../../export_synth/convert.py): change
+  `target = ct.target.macOS13` to `target = ct.target.<LATEST>`,
+  scoped to the `decoder-har` mode branch.
+- [ ] `uv run python -m pytest tests/ -q` — green.
+
+**Phase 2 — Re-export at the new target + waveform parity:**
+
+- [ ] `uv run --no-sync python -m export_synth.main --mode decoder-har --buckets 3s,10s -o coreml`.
+- [ ] Confirm target took effect:
+  `uv run python -c "import coremltools as ct; print(ct.models.MLModel('coreml/kokoro_decoder_har_post_10s.mlpackage').get_spec().specificationVersion)"`
+  should print **> 7**.
+- [ ] Waveform parity vs rank-4 / ios16 / cml8 baseline:
+  Pearson > 0.99 / SNR ≥ 40 dB / max abs Δ ≤ 1e-2 on the 10s bucket
+  via `compare_decoder_har_post_waveforms.py`.
+- [ ] `uv run python -m pytest tests/test_mlpackage_exports.py -q`
+  — pass.
+
+**Phase 3 — ANE placement verification:**
+
+- [ ] Xcode Performance Report on the new 10s package. Save
+  screenshot to `outputs/ane_rank4/xcode_latest_target_compute_unit_map_10s.png`
+  (gitignored). Record `All / CPU / GPU / Neural Engine` counts;
+  verify `ios<N>.*` op-type prefixes match the bumped target.
+- [ ] Probe triplet: `.all` / `.gpu` / `.ne` in fresh subprocesses
+  via `/tmp/ane-investigation/probe.py`. Compare sha256s against
+  iteration 1's table (`.all` was `28041dfea5c8b6e1`, `.gpu`
+  matched). If `.all` sha now **differs** from `.gpu`, ANE is
+  engaging.
+- [ ] Espresso `log stream` via
+  `/tmp/ane-investigation/capture_logs.sh ... all ...`. Count
+  `Unsupported op N` events. Hard gate: **≤ 100**.
+- [ ] Append a row to the
+  [Results log](#results-log-commit-this) above: label
+  "Rank-4 + cml9 + latest target".
+
+### Pre-named iteration 3 escalation
+
+- **ANE > 0 (any value):** open
+  `ane-decoder-har-target-floor-v1.md` (or another iteration in
+  this same plan) to backward-search for the earliest target that
+  still engages ANE.
+- **ANE = 0 but `Unsupported op` count ≤ ~150:** add iteration 3 =
+  fp16 input dtypes (Step 4(b)). Residual rejection is then at the
+  input boundary.
+- **ANE = 0 and `Unsupported op` near 298:** the rank-4 +
+  newest-tooling + newest-target combo wasn't enough. Iteration 4
+  territory; options are (a) per-op rewrite (split AdaIN's
+  instance-norm differently), (b) accept GPU fallback and document
+  ANE non-engagement on M3 Max / macOS 26 as a known limitation.
+
+### Iteration 2 Open Questions
+
+#### Resolved (iter 2)
+
+- **Q:** Stay on the same branch (`ane-decoder-har-rank4-v1`) or cut
+  a new one?
+- **A:** Same branch. Iterations layer cleanly; one PR eventually
+  carries the whole engagement arc.
+- **Q:** Should iteration 2 be a separate plan file or a section
+  here?
+- **A:** Section in this plan. The whole HAR-on-ANE investigation
+  reads as one document.
+
+#### Unresolved (iter 2)
+
+- **Q:** Is `coremltools==9.0` installable on Python 3.12.12 /
+  torch 2.5.0 / macOS 26.4?
+- **Options:** Phase 0 verifies via `uv pip install --dry-run`. If
+  9.0 wants Python ≥ 3.13 or torch ≥ 2.7, widen the upgrade scope.
+- **Q:** What's the highest `ct.target` value coremltools 9.0
+  exposes?
+- **Options:** Phase 0 enumerates and locks. Expected `iOS19+` /
+  `macOS26`-equivalent.
+- **Q:** Will the macOS app's deployment target accept the new
+  OS-version floor?
+- **Options:** Check before merge. If incompatible, iteration 2 is
+  diagnostic-only and rolled back before shipping.
+
+### Iteration 2 Risks (delta vs iteration 1)
+
+| Risk | Mitigation |
+| --- | --- |
+| coremltools 9.0 isn't installable on the current Python / torch | Phase 0 dry-run check first. Accept any forced pin upgrades, or fall back to the highest installable 8.x. |
+| coremltools 9.0 changes MIL lowering for Conv2d / ConvTranspose2d / pad ops | Phase 0 re-runs `--probe-conv-lowering`. If `all_equivalent` regresses, revert to 8.3.0 and document. |
+| Same-target same-rank re-export under 9.0 drifts numerically | Phase 0 cross-version waveform-parity sanity check. Loosen gate if needed but document drift source. |
+| Target bump silently fails (spec version unchanged) | Phase 2 explicit `specificationVersion` cross-check. |
+| Target bump breaks downstream consumers on older macOS | Verify macOS app deployment target before merge. Diagnostic-only and rolled back if incompatible. |
+| Other modes (`decoder` / `full`) in `convert.py` break because they share the `target` variable | Phase 1 guards the new target to the `decoder-har` branch only. |
+
+### Iteration 2 Rollback
+
+- **Revert Phase 1:** `git revert <Phase 1 commit>` restores
+  `ct.target.macOS13`. Re-export brings packages back to the
+  rank-4 / ios16 / cml9 state.
+- **Revert Phase 0:** `git revert <Phase 0 commit>` restores
+  `coremltools==8.3.0`. `uv pip install -r requirements-bakeoff.txt`
+  reinstalls the 8.3.0 stack.
+- **Time:** < 10 minutes total (revert + reinstall + re-export).
+- **Data recovery:** none. Baselines preserved at
+  `/tmp/kokoro_decoder_har_post_{3s,10s}.rank4_ios16.mlpackage`.
