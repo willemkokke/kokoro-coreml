@@ -379,27 +379,50 @@ upsample/noise-conv kernels).
 
 **Tasks:**
 
-- [ ] Re-run `uv run python scripts/count_mil_ops.py coreml/kokoro_decoder_har_post_10s.mlpackage`
+- [x] Re-run `uv run python scripts/count_mil_ops.py coreml/kokoro_decoder_har_post_10s.mlpackage`
   and confirm the 2207-op rank-3 baseline histogram matches the
-  [Fresh Baseline](#fresh-baseline-current-state) above. Record any
-  delta and resolve before moving on.
-- [ ] Extend
+  [Fresh Baseline](#fresh-baseline-current-state) above. **Done
+  2026-05-15:** baseline confirmed exactly — 2207 total ops; all per-type
+  counts match the Fresh Baseline (`const` 1166, `add` 218, `mul` 148,
+  `tile` 96, `reduce_mean` 88, `conv` 51, `sin` 50, `linear` 48,
+  `reshape` 48, `split` 48, `pow` 48, `sub` 45, `square` 44, `sqrt` 44,
+  `real_div` 44, `slice_by_index` 6, `cast` 5, `conv_transpose` 4,
+  `leaky_relu` 3, `pad` 1, `exp` 1, `cos` 1). JSON saved at
+  `outputs/ane_rank4/phase0_baseline_histogram_10s.json` (gitignored).
+- [x] Extend
   [`scripts/count_mil_ops.py`](../../scripts/count_mil_ops.py)'s
   `--probe-conv-lowering` mode to also probe `Conv2d(in, out, (1, k))`
-  with k in `{3, 7}` (the real Generator kernels), and
-  `ConvTranspose2d(in, out, (1, k))` with stride `(1, u)` and padding
-  `(0, (k-u)//2)` for k=u=10..20 (the upsample stride space). Each must
-  lower to a single MIL `conv` or `conv_transpose` op with no inserted
-  `reshape` or `transpose`. If any pattern lowers to extra reshape ops,
-  fail Phase 0 and reconsider the rewrite strategy.
-- [ ] **Lock taxonomy:** Phase 3 will compare op histograms using the
-  exact `op.type` strings produced by this script. Pin the version of
-  the script in commit history so the comparison is reproducible.
+  for the real Generator kernels and `ConvTranspose2d(in, out, (1, k))`
+  with stride `(1, u)`. **Done 2026-05-15:** the probe now covers 15
+  cases:
+  - Conv k=1 baseline.
+  - AdaINResBlock1 convs1: k ∈ {3, 7, 11} × dilation ∈ {1, 3, 5} (9 cases).
+  - noise_convs[0]: k=12 stride=6 padding=3.
+  - conv_post: k=7 stride=1 padding=3.
+  - ups[0]: ConvTranspose k=20 stride=10 padding=5.
+  - ups[1]: ConvTranspose k=12 stride=6 padding=3.
+  - ReflectionPad1d((1, 0)) vs ReflectionPad2d((1, 0, 0, 0)).
+
+  All 15 cases lower to the **same MIL op-type set** between rank-3 and
+  rank-4 variants (`{cast, const, conv}` for conv cases,
+  `{cast, const, conv_transpose}` for transpose cases,
+  `{cast, const, pad}` for the reflection pad case). `all_equivalent:
+  true` — exit code 0. Full JSON saved at
+  `outputs/ane_rank4/phase0_probe_results.json` (gitignored).
+  **Open Question (a) resolved in the affirmative**: ConvTranspose2d
+  with `(1, k)` and stride `(1, u)` does lower to a single MIL
+  `conv_transpose` op on coremltools 8.3.0 + macOS 26.4 + torch 2.6.0.
+  No fragmentation, no extra reshape / transpose ops, no fallback to
+  the `Upsample + Conv2d` alternative needed.
+- [x] **Lock taxonomy:** the extended probe is committed in this phase.
+  Phase 3 compares op histograms using the same `op.type` strings
+  produced by this script.
 
 **Verification:** Conv2d(1, k) and ConvTranspose2d((1, k), stride=(1, u))
 both lower to a single MIL `conv` / `conv_transpose` op for the real
 kernel/stride sizes used in `kokoro/istftnet.py::Generator`. Histogram
-deltas vs the baseline are zero (or explained).
+delta vs the baseline is zero (re-run on the same package returns the
+same counts).
 
 ---
 
@@ -775,19 +798,21 @@ waveform parity gates still green from Phase 2.
   public API. Treat as suggestive, not load-bearing. The rank-4 fix
   doesn't depend on resolving this.
 
-### Unresolved
-
 - **Q:** Will `nn.ConvTranspose2d` with stride `(1, u)` and padding
   `(0, (k-u)//2)` produce a single MIL `conv_transpose` op on the
   current coremltools 8.3.0 + macOS 26 stack, or does it lower to a
   `conv_transpose` + `reshape` combo that fragments ANE eligibility?
-- **Options:** Phase 0's `--probe-conv-lowering` extension answers this.
-  If it fragments, fall back to (a) `nn.ConvTranspose1d` with explicit
-  unsqueeze/squeeze around it (worse — re-introduces reshape ops in
-  the body), or (b) `nn.Upsample(scale_factor=u, mode='linear')` +
-  `nn.Conv2d` to emulate, with a load hook that re-flows the
-  ConvTranspose1d weight into the Upsample+Conv2d pair. **Current lean:**
-  expect ConvTranspose2d to lower cleanly; if not, prefer (b) over (a).
+- **A (resolved 2026-05-15 by Phase 0 probe):** Single `conv_transpose`
+  op, no fragmentation. The extended `--probe-conv-lowering` mode
+  verifies this for both `ups[0]` (k=20, stride=10, padding=5) and
+  `ups[1]` (k=12, stride=6, padding=3) on coremltools 8.3.0 + torch
+  2.6.0 + macOS 26.4. Both rank-3 ConvTranspose1d and rank-4
+  ConvTranspose2d lower to the identical MIL op set
+  `{cast, const, conv_transpose}`. The Upsample+Conv2d fallback path is
+  no longer needed.
+
+### Unresolved
+
 - **Q:** Will `tile` (96 occurrences in rank-3 baseline) drop to zero
   after rank-4, or does some tiling persist (e.g., for repeating the
   style vector along T inside AdaIN2d)?
