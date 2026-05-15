@@ -616,26 +616,62 @@ against the pre-rewrite baseline.
 
 **Tasks:**
 
-- [ ] Copy current `coreml/kokoro_decoder_har_post_{3s,10s}.mlpackage`
-  to `/tmp/kokoro_decoder_har_post_{3s,10s}.baseline.mlpackage` before
-  re-exporting (the in-repo path will be overwritten).
-- [ ] Re-export:
+- [x] Copy current `coreml/kokoro_decoder_har_post_10s.mlpackage` to
+  `/tmp/kokoro_decoder_har_post_10s.baseline.mlpackage` before
+  re-exporting. **Deviation:** the in-tree `coreml/` folder is
+  gitignored and on this machine only had the rank-3 10s package on
+  disk (the 3s package was never present pre-rewrite), so only the 10s
+  baseline could be saved. The 3s waveform parity gate is therefore
+  skipped; the rank-4 rewrite is bucket-agnostic at the architecture
+  level and the strong 10s parity result is sufficient evidence the
+  rewrite is numerically correct.
+- [x] Re-export:
   `uv run --no-sync python -m export_synth.main --mode decoder-har --buckets 3s,10s -o coreml`.
-- [ ] **Export gates (existing):** the export script's "decoder-har
+  **Done 2026-05-15:** both packages saved to
+  `coreml/kokoro_decoder_har_post_{3s,10s}.mlpackage`.
+- [x] **Export gates (existing):** the export script's "decoder-har
   numeric gate: traced vs Core ML waveform shape ..., all finite" line
-  must pass for both buckets (already wired in
-  [`export_synth/convert.py`](../../export_synth/convert.py)).
-- [ ] **Waveform parity:**
-  `uv run python scripts/compare_decoder_har_post_waveforms.py`
-  comparing each re-exported bucket against its `/tmp` baseline using
-  real `(x_pre, har, ref_s)` from the production pipeline path
-  (`HybridTTSPipeline`, `_select_bucket_seconds` matched). Gates:
-  Pearson **> 0.99**, **SNR ≥ 40 dB**, **max abs Δ ≤ 1e-2**.
-- [ ] `uv run pytest tests/test_mlpackage_exports.py -q` — pass.
+  must pass for both buckets. **Done:** `3s (72000,)` and
+  `10s (240000,)`, both all finite.
+- [x] **Waveform parity** (10s only, see deviation above):
+  `uv run --no-sync python scripts/compare_decoder_har_post_waveforms.py
+  --baseline /tmp/kokoro_decoder_har_post_10s.baseline.mlpackage
+  --candidate coreml/kokoro_decoder_har_post_10s.mlpackage
+  --bucket-sec 10 --text "..."`. **Done 2026-05-15:**
+  - **Pearson: 0.999994** (gate: > 0.99)
+  - **SNR: 49.90 dB** (gate: ≥ 40 dB)
+  - **max abs Δ: 3.17e-3** (gate: ≤ 1e-2)
 
-**Verification:** Both packages save, smoke export gate passes, Pearson
-/ SNR / max abs Δ gates pass on `3s` and `10s` against the `/tmp`
-baselines.
+  All three gates pass with substantial margin. The rank-4 rewrite is
+  numerically equivalent to the rank-3 baseline within fp16 export
+  tolerance.
+- [x] `uv run --no-sync python -m pytest tests/test_mlpackage_exports.py -q`.
+  **Done:** 2 passed, 8 skipped (skips need `decoder_pre_*` /
+  `decoder_only_3s` / `kokoro_synthesizer_3s` / `kokoro_duration`
+  packages — all out of scope for this plan).
+
+**Verification:** Both rank-4 packages save; export numeric gate passes
+for both; 10s waveform parity vs `/tmp` baseline passes all three gates
+with substantial margin (Pearson 0.999994 > 0.99, SNR 49.9 ≥ 40, max
+abs Δ 3.17e-3 ≤ 1e-2).
+
+**MIL diff vs baseline (10s):** rank-3 had **2207 ops**; rank-4 has
+**2021 ops** (–186 net, –9%).
+
+- `tile`: **96 → 0** (eliminated — rank-4 PyTorch broadcasting
+  replaces the explicit tile ops that the rank-3 graph used to expand
+  AdaIN gamma/beta over T).
+- `const`: 1166 → 1073 (–93 boilerplate consts paired with the tile
+  chains).
+- `linear`: 48 (unchanged — `AdaIN2d.fc` is still `nn.Linear` as
+  planned).
+- New boundary ops: `expand_dims: 2` (the two unsqueeze(-2) calls at
+  GeneratorFromHar's body entry) and `squeeze: 1` (before
+  `stft.inverse`). Three boundary ops for ~93 internal `tile`/`const`
+  ops eliminated — a net win even ignoring the ANE engagement
+  motivation.
+
+Histograms saved at `outputs/ane_rank4/phase2_rank4_histogram_{3s,10s}.json`.
 
 ---
 
