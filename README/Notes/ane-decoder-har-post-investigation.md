@@ -360,15 +360,44 @@ goes ahead, the probe + dump scripts should be hardened and moved under
 - [Core ML Compute Unit Scheduling Guide](../Guides/apple-silicon/CoreML-Compute-Unit-Scheduling-guide.md) — documented `.all` / `.cpuAndGPU` / `.cpuAndNeuralEngine` semantics + silent fallback reference.
 - [CLAUDE.md, Part 4.1 — ANE memory layout](../../CLAUDE.md) — `(B, C, 1, T)` rule with `T` largest; 64-byte last-axis alignment penalty.
 
-## Resolution status
+## Progress status
 
 The §5 Recommendation here was executed as the rank-4 rewrite tracked in
 [`README/Plans/ane-decoder-har-rank4-rewrite-v1.md`](../Plans/ane-decoder-har-rank4-rewrite-v1.md).
-**Outcome:** rank-4 alone is necessary but not sufficient on M3 Max /
-macOS 26.4 / `ct.target.macOS13`. ANE engagement is still 0 / 948 in
-Xcode; however the rewrite kept independent wins (shape-inference
-disqualifier resolved, `.all` cold-load 26.5 s → 1.075 s, MIL ops
-2207 → 2021 with `tile` 96 → 0, full waveform parity). The HAR-on-ANE
-investigation continues in that same plan's
-[Iteration 2 section](../Plans/ane-decoder-har-rank4-rewrite-v1.md#iteration-2-coremltools-90-upgrade--latest-target)
-(coremltools 9.0 + latest target).
+The HAR-on-ANE engagement effort is in progress; this footer logs
+where each iteration on the same branch (`ane-decoder-har-rank4-v1`)
+landed.
+
+**Iteration 1 — rank-4 rewrite only.** Necessary but not sufficient on
+M3 Max / macOS 26.4 / `ct.target.macOS13`. ANE engagement was 0 / 948
+in Xcode; the rewrite kept independent wins (shape-inference site
+resolved, `.all` cold-load 26.5 s → 1.075 s, MIL ops 2207 → 2021 with
+`tile` 96 → 0, full waveform parity).
+
+**Iteration 2 — rank-4 + coremltools 9.0 + `ct.target.iOS26`.** ANE
+engagement milestone reached: Xcode `All 948 / CPU 395 / GPU 52 /
+Neural Engine 501` on the same hardware — **501 of 948 ops on the
+Neural Engine** (52.8%, up from 0/948 in iteration 1). Two targets
+were tested in this series so far: `ct.target.macOS13` (= iOS16,
+iteration 1) gave 0/948 ANE, and `ct.target.iOS26` (this iteration)
+gave 501/948. iOS26 is sufficient to engage ANE on this hardware;
+**whether iOS17 / iOS18 (or any other lower target) would also
+engage it is untested here** — the minimum-sufficient target is the
+iteration-3 backward search. Probe triplet confirms ANE is in the
+compute path (`.all` sha `07d2d9f117d0e62d` differs from
+`.cpuAndGPU` sha `55cf0ef33cc97841`). The fp32→fp16 entry cast that
+this note framed as a red-herring stayed a red-herring (boundary
+casts went to CPU/GPU; the body engaged ANE at the iOS26 target).
+
+**Iteration 2 trade-off — predict-time regression flagged.** Xcode
+median Prediction 387.57 ms vs iteration 1's 103.22 ms (~3.75×
+slower). The 395 CPU ops are the dominant cost. `.cpuAndNE` runtime
+config measures 310 ms warm predict, `.all` 392 ms, `.cpuAndGPU`
+468 ms — the 52 GPU ops in `.all`'s mixed plan are net-negative.
+**Iteration 3 (in progress, same branch) is the performance work** to
+close the gap toward the iteration-1 latency baseline while keeping
+the engagement count. Full numbers + per-iteration results-log row
+in the plan's
+[Iteration 2 section](../Plans/ane-decoder-har-rank4-rewrite-v1.md#iteration-2-coremltools-90-upgrade--latest-target);
+iteration-3 question list is at the bottom of the plan's
+[Conclusion and next iteration](../Plans/ane-decoder-har-rank4-rewrite-v1.md#conclusion-and-next-iteration).

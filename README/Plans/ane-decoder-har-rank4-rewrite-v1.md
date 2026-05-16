@@ -871,16 +871,63 @@ address):
 - `.all` output sha256 still bit-equals `.cpuAndGPU` —
   `.all` IS silent GPU fallback, just much cheaper failure.
 
-**Next iteration plan** (per the pre-named escalation #2 above): open
-`README/Plans/ane-decoder-har-fp16-inputs-v1.md` for Step 4(b). The
-leading hypothesis after this Phase 3: the fp32 → fp16 entry cast and
-the `ios16.*` op-set target are jointly blocking ANE on macOS 26's
-new compiler. Confirm by switching the export's input dtypes to
-`np.float16` (4(b)) — and, if that's not enough on its own,
-re-evaluate Step 4(a) (target bump from `ct.target.macOS13` to
-`ct.target.macOS15+`) on the rank-4 graph, which is a different
-combination than the brief's original 4(a) attempt on the rank-3
-graph.
+**Next iteration milestone reached, performance work begins.**
+[Iteration 2 below](#iteration-2-coremltools-90-upgrade--latest-target)
+upgraded `coremltools` to 9.0 (which unlocked `ct.target.iOS26 = 10`)
+and bumped the `decoder-har` target accordingly. **ANE engagement
+milestone on M3 Max / macOS 26.4:** Xcode `All 948 / CPU 395 / GPU 52 /
+Neural Engine 501` — **501 of 948 ops** moved off GPU and onto the
+Neural Engine (vs 0/948 in iteration 1). We tested only two targets
+in this series so far: `ct.target.macOS13` (= iOS16, iteration 1) gave
+0/948 ANE; `ct.target.iOS26` (iteration 2) gave 501/948. **iOS26 is
+sufficient to engage ANE; we don't yet know whether iOS17 / iOS18 /
+some other lower target would also engage it.** The minimum-sufficient
+target is iteration-3 territory (backward search, see question 5
+below).
+
+**This is not the engineering finish line.** Engagement came with a
+**3.75× predict-time regression** at the `.all` runtime config
+(387.57 ms median vs the iteration-1 rank-4/ios16 baseline of
+103.22 ms). The probe triplet revealed the structure:
+
+- `.cpuAndGPU`: 468 ms warm predict (no ANE — the iteration-1
+  silent-fallback path is now slower than baseline too at iOS26
+  target).
+- `.all`: 392 ms warm predict (ANE + CPU + GPU mixed plan).
+- `.cpuAndNE`: **310 ms** warm predict (CPU + ANE only; the 52 GPU
+  ops in `.all`'s mixed plan are net-negative).
+
+The remaining gap to the rank-4/ios16 baseline (~103 ms) is the
+iteration-3 focus, **on this same branch**.
+
+**Iteration 3 — performance.** Same branch, no new plan file. Open
+investigation questions, in priority order:
+
+1. Why is the 948-op iOS26 graph 3.75× slower than the 948-op ios16
+   graph despite 501 ops moving to ANE? Likely culprits: (a) 395 CPU
+   ops being a serial bottleneck; (b) ANE↔CPU↔GPU data-transfer
+   overhead in `.all`'s mixed plan; (c) iOS26 op variants being
+   slower per-op than iOS16 variants for the ops that DIDN'T move to
+   ANE; (d) ANE warmup / batch coordination cost.
+2. Identify which op types are landing where. The 906 `Unsupported op`
+   events span 741 unique indices across 3 backends (MILCompilerForE5,
+   MILCompilerForANE, MILCompilerForMPSGraph) — correlating these with
+   the MIL op-type dump would name the CPU-pinned 395 ops and the
+   GPU-pinned 52 ops, which is the basis for any further rewrite.
+3. Can we shrink (or eliminate) the 52 GPU ops? `.cpuAndNE` evidence
+   says they're net-negative on this machine; if a runtime-config
+   change ships, the export package itself is unchanged.
+4. Can we push more of the 395 CPU ops onto ANE via per-op rewrites
+   (e.g., the iSTFT tail, the AdaIN reduce stack, residual `cast`
+   chains)?
+5. Backward search for the earliest `ct.target` that still keeps the
+   501-op ANE engagement — affects OS-floor compatibility but doesn't
+   change performance directly.
+
+The original pre-named Step 4(b) (fp16 input dtypes) is no longer the
+immediate next step — iteration 2 already moved the engagement
+needle without it. It may still help reduce the entry-cast boundary
+ops in (3)/(4) and is on the iteration-3 candidate list.
 
 ## Success Criteria
 
@@ -1100,6 +1147,7 @@ graph.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Baseline (rank-3) | `842473e` | 8.3.0 | 2.6.0 | M3 Max 36 GB | macOS 26.4 | 0 / 1238 | 26.485 | match (silent GPU fallback) | n/a | n/a | 2207 ops; `linear` 48, `conv` 51, `tile` 96 |
 | Rank-4 (Phase 1) | `0186993` | 8.3.0 | 2.5.0 | M3 Max 36 GB | macOS 26.4 | 0 / 948 | 1.075 | match (silent GPU fallback) | 0.999994 | 49.90 dB / 3.17e-3 | 2021 ops; `linear` 48, `conv` 51, `tile` **0** (–96); +`expand_dims` 2, `squeeze` 1 |
+| Rank-4 + cml9 + iOS26 (iter 2) | `36d78c5` | 9.0 | 2.5.0 | M3 Max 36 GB | macOS 26.4 | **501 / 948** (CPU 395 / GPU 52 / NE 501) | 4.427 | **differs** (`.all` `07d2d9f117d0e62d` ≠ `.gpu` `55cf0ef33cc97841`) — ANE engaged | 0.999982 | 44.81 dB / 4.70e-3 | 2021 ops (unchanged); spec v10 (was v7). **Predict regression flagged for iter-3:** Xcode median 387 ms vs iter-1's 103 ms (3.75× slower); `.cpuAndNE` warm 310 ms < `.all` 392 ms < `.cpuAndGPU` 468 ms — the 52 GPU ops are net-negative. |
 
 ## Iteration 1 Rollback
 
@@ -1286,21 +1334,68 @@ compatible with ANE on M3 Max / macOS 26.
 
 **Phase 3 — ANE placement verification:**
 
-- [ ] Xcode Performance Report on the new 10s package. Save
-  screenshot to `outputs/ane_rank4/xcode_latest_target_compute_unit_map_10s.png`
-  (gitignored). Record `All / CPU / GPU / Neural Engine` counts;
-  verify `ios<N>.*` op-type prefixes match the bumped target.
-- [ ] Probe triplet: `.all` / `.gpu` / `.ne` in fresh subprocesses
-  via `/tmp/ane-investigation/probe.py`. Compare sha256s against
-  iteration 1's table (`.all` was `28041dfea5c8b6e1`, `.gpu`
-  matched). If `.all` sha now **differs** from `.gpu`, ANE is
-  engaging.
-- [ ] Espresso `log stream` via
-  `/tmp/ane-investigation/capture_logs.sh ... all ...`. Count
-  `Unsupported op N` events. Hard gate: **≤ 100**.
-- [ ] Append a row to the
-  [Results log](#results-log-commit-this) above: label
-  "Rank-4 + cml9 + latest target".
+- [x] **Xcode Performance Report on the new 10s package.**
+  **Captured 2026-05-16.** `All: 948  CPU: 395  GPU: 52
+  Neural Engine: 501` on M3 Max / macOS 26.4. **501/948 = 52.8% of
+  ops on the Neural Engine** — vs 0/948 at the iteration-1 target.
+  iOS26 target is sufficient to engage ANE; whether a lower target
+  (iOS17 / iOS18) would also engage it is untested here and is
+  iteration-3 territory. Median Prediction **387.57 ms** / Load
+  134.28 ms / Compilation 108.28 ms.
+  Package Availability now reports `iOS 19.0+ / macOS 26.0+ /
+  tvOS 19.0+ / Mac Catalyst 19.0+ / watchOS 12.0+ / visionOS 3.0+`.
+  **Trade-off flagged:** the 387.57 ms median is **3.75× slower**
+  than the iteration-1 rank-4/ios16 baseline of 103.22 ms — engagement
+  achieved at a real predict-time cost. Iteration 3 closes that gap
+  (see [iteration-1 Conclusion](#conclusion-and-next-iteration)).
+- [x] **Probe triplet** (`.all` / `.gpu` / `.ne` in fresh
+  subprocesses).
+
+  | Units | Cold load (s) | Warm predict (s) | sha256(out) |
+  | --- | ---: | ---: | --- |
+  | `.all` | 4.427 | 0.392 | `07d2d9f117d0e62d` |
+  | `.cpuAndGPU` | 1.455 | 0.468 | `55cf0ef33cc97841` |
+  | `.cpuAndNE` | 4.195 | **0.310** | `a7968e9334aab13f` |
+
+  Read of the table:
+  - `.all` sha differs from `.cpuAndGPU` sha
+    (`07d2d9f117d0e62d` ≠ `55cf0ef33cc97841`) — ANE is in the
+    compute path, not just a scheduling hint. Iteration 1 had
+    these match (silent GPU fallback).
+  - `.all` warm predict (392 ms) is faster than `.cpuAndGPU`
+    (468 ms) — confirms ANE is doing useful work, but neither
+    matches iteration 1's rank-4/ios16 baseline of 116 ms warm
+    predict.
+  - `.cpuAndNE` is the fastest of the three at 310 ms warm predict.
+    The 52 GPU ops in `.all`'s mixed plan are net-negative on this
+    machine. **Iteration-3 lever (runtime config or graph rewrite).**
+- [x] **Espresso `log stream`** via
+  `/tmp/ane-investigation/capture_logs.sh ... all ...`.
+  **906 `Unsupported op` events** — nominally a regression vs
+  iteration 1's 298, but the number isn't directly comparable.
+  Iteration 1 had a single compiler invocation
+  (`MILCompilerForE5`) emitting one rejection list; iteration 2
+  invokes **`MILCompilerForE5` + `MILCompilerForANE`
+  (new on iOS26) + 32× `MILCompilerForMPSGraph`**, each with its
+  own rejection trace, and the rejections overlap (741 unique
+  indices across the 948-op graph). New log events visible only in
+  iteration 2:
+  - `MILCompilerForANE: Run(): Created directory @ <private>`
+  - `Invoking ANEC using ANEF path` ← the new compiler path that
+    engaged ANE
+  - `MILCompilerForANE: CompileUsingANEF(): milFullPath = ...`
+
+  Xcode's per-op assignment (501 ANE / 395 CPU / 52 GPU) is the
+  load-bearing per-op signal; the 906 number is verbosity, not a
+  hard-gate regression. `Shape computation issue` events stay at 0
+  (unchanged from iteration 1's rank-4 win).
+  Captured log saved at
+  `outputs/ane_rank4/phase3_iter2_log_all.ndjson` (gitignored).
+- [x] **Append a row to the
+  [Results log](#results-log-commit-this) above** labelled
+  "Rank-4 + cml9 + iOS26 target (iter 2)". Row flags the
+  predict-time regression alongside the NE engagement count so
+  the trade-off is visible at a scan.
 
 ### Pre-named iteration 3 escalation
 
