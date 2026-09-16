@@ -96,7 +96,8 @@ class ModelCache: KokoroModelProvider {
     let modelsDir: URL
     let durationConfig: MLModelConfiguration
     let f0nConfig: MLModelConfiguration
-    let decoderPreConfig: MLModelConfiguration
+    let computeUnits: MLComputeUnits
+    let stagedComputeUnits: Bool
     let generatorConfig: MLModelConfiguration
     private let durationChoices: [DurationModelChoice]
 
@@ -114,24 +115,30 @@ class ModelCache: KokoroModelProvider {
 
     init(modelsDir: URL, computeUnits: MLComputeUnits = .all, stagedComputeUnits: Bool = false) {
         self.modelsDir = modelsDir
+        self.computeUnits = computeUnits
+        self.stagedComputeUnits = stagedComputeUnits
         if stagedComputeUnits {
             self.durationConfig = Self.makeConfig(.cpuAndGPU)
             self.f0nConfig = Self.makeConfig(.cpuAndGPU)
-            self.decoderPreConfig = Self.makeConfig(.cpuAndNeuralEngine)
             self.generatorConfig = Self.makeConfig(.cpuAndGPU)
         } else {
             self.durationConfig = Self.makeConfig(computeUnits)
             self.f0nConfig = Self.makeConfig(computeUnits)
-            self.decoderPreConfig = Self.makeConfig(computeUnits)
             self.generatorConfig = Self.makeConfig(computeUnits)
         }
         self.durationChoices = KokoroPipeline.discoverDurationChoices(modelsDirectory: modelsDir)
         if stagedComputeUnits {
-            fputs("  Compute units: staged (duration/f0n/generator=cpuAndGPU, decoderPre=cpuAndNeuralEngine)\n", stderr)
+            fputs("  Compute units: staged (duration/f0n/generator=cpuAndGPU, decoderPre=cpuAndNeuralEngine up to \(PipelineConstants.decoderPreNeuralEngineMaxBucketSeconds)s, cpuAndGPU above)\n", stderr)
         } else {
             fputs("  Compute units: \(computeUnitLabel(computeUnits))\n", stderr)
         }
         fputs("  Duration choices: \(durationChoices.map { $0.cacheKey }.joined(separator: ", "))\n", stderr)
+    }
+
+    /// decoder-pre placement follows the bucket under the staged policy (see
+    /// `PipelineConstants.decoderPreComputeUnits`); other policies use one unit.
+    private func decoderPreConfig(bucket: Int) -> MLModelConfiguration {
+        Self.makeConfig(stagedComputeUnits ? PipelineConstants.decoderPreComputeUnits(bucketSec: bucket) : computeUnits)
     }
 
     private static func makeConfig(_ computeUnits: MLComputeUnits) -> MLModelConfiguration {
@@ -229,7 +236,7 @@ class ModelCache: KokoroModelProvider {
         if let cached = decPreModels[bucket] { return cached }
         let compiled = try compiledDecPreURL(bucket: bucket)
         fputs("  Loading decoder_pre \(bucket)s...\n", stderr)
-        let model = try MLModel(contentsOf: compiled, configuration: decoderPreConfig)
+        let model = try MLModel(contentsOf: compiled, configuration: decoderPreConfig(bucket: bucket))
         decPreModels[bucket] = model
         return model
     }

@@ -1365,6 +1365,10 @@ The 30 s generator varies by about 10% between passes on this machine; on the sa
 
 The opt-in exact-length duration packages (`KOKORO_USE_EXACT_DURATION_MODELS=1`) take 7.4, 11.1, 20.3 and 37.2 ms on the four frozen texts; the padded path on the branch takes 8.9, 13.5, 24.0 and 43.1 ms.
 
+### decoder-pre placement follows the bucket
+
+decoder-pre was the one stage that scaled worse than linearly: 15 ms at 15 s but 47 ms at 30 s on the Neural Engine, with every op ANE-preferred at both sizes (compute plans identical, 265 of 265). The ANE's cost per frame rises with the axis length (16 µs at the 10 s bucket, 25 at 15 s, 39 at 30 s) while the GPU's falls (21, 20, 14.5 µs), so the two cross between the 10 s and 15 s buckets. The staged policy now keeps decoder-pre on the ANE up to the 10 s bucket and runs it on the GPU above (`PipelineConstants.decoderPreNeuralEngineMaxBucketSeconds`). Interleaved on the same build, two passes: stage 15.3 → 10.0 ms at 15 s, 47 → 17 ms at 30 s; end to end 15 s 201 → 196 ms, 15 s-in-30 s 385 → 353 ms, 30 s 406 → 374 ms; the three smaller buckets are unchanged. Measured on an M3 Max; a device with a weaker GPU may cross later, which is why the threshold is one named constant.
+
 ### Provenance
 
 - Machine: Apple M3 Max, 36 GB, macOS 26.5.1, Xcode 26.6, coremltools 8.3.0, torch 2.6.0

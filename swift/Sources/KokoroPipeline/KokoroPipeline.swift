@@ -58,6 +58,18 @@ public enum PipelineConstants {
 
     /// Default bucket seconds used by the bakeoff and runtime package set.
     public static let defaultBuckets: [Int] = [3, 7, 10, 15, 30]
+    /// Largest bucket whose decoder-pre package runs on the Neural Engine; larger
+    /// buckets run it on the GPU. Every decoder-pre op is ANE-eligible at every
+    /// bucket, but the ANE's cost per frame rises with the axis length (16 us at
+    /// 10 s, 25 at 15 s, 39 at 30 s on an M3 Max) while the GPU's falls (21, 20,
+    /// 14.5 us), so the two cross between the 10 s and 15 s buckets: 47 ms on the
+    /// ANE against 17 ms on the GPU at 30 s. Measured on an M3 Max; a device with
+    /// a weaker GPU may cross later.
+    public static let decoderPreNeuralEngineMaxBucketSeconds: Int = 10
+    /// Compute units for the decoder-pre package of `bucketSec`.
+    public static func decoderPreComputeUnits(bucketSec: Int) -> MLComputeUnits {
+        bucketSec <= decoderPreNeuralEngineMaxBucketSeconds ? .cpuAndNeuralEngine : .cpuAndGPU
+    }
 
     /// Duration model enumerated token sizes. Caller pads to nearest.
     public static let durationTokenSizes: [Int] = [32, 64, 128, 256, 320, 384, 512]
@@ -243,7 +255,7 @@ public class KokoroPipeline: KokoroModelProvider {
             let url = modelsDirectory.appendingPathComponent("kokoro_decoder_pre_\(sec)s.mlpackage")
             if FileManager.default.fileExists(atPath: url.path) {
                 let config = MLModelConfiguration()
-                config.computeUnits = .cpuAndNeuralEngine
+                config.computeUnits = PipelineConstants.decoderPreComputeUnits(bucketSec: sec)
                 decPreModels[sec] = try MLModel(contentsOf: MLModel.compileModel(at: url), configuration: config)
             }
         }
